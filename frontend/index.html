@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="JASPA — Autonomous Startup Intelligence Platform. Multi-agent AI for business opportunity discovery and venture planning."
+    />
+    <title>JASPA — Autonomous Startup Intelligence</title>
+    <script>
+      ;(() => {
+        const theme = localStorage.getItem("theme") || "dark"
+        document.documentElement.classList.toggle("dark", theme !== "light")
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

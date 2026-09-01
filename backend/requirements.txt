@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+agno>=3
+firecrawl
+openai
+python-dotenv
