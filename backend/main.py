@@ -17,7 +17,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from urllib.parse import urlencode
 
@@ -28,6 +28,9 @@ import auth
 import scheduler as sched
 import store
 from scheduler import scheduler
+
+# Serve the built frontend in production (single-service deployment).
+_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 
 
 @asynccontextmanager
@@ -45,12 +48,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if _RENDER_EXTERNAL_URL:
+    _allowed_origins.append(_RENDER_EXTERNAL_URL.rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -552,3 +560,29 @@ def ask(req: AskRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Frontend static hosting (production single-service deployment)
+# ---------------------------------------------------------------------------
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+if os.path.isdir(_FRONTEND_DIST):
+    # Assets with hashed filenames — cache hard.
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")),
+        name="assets",
+    )
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str):
+        """Serve the SPA: real files directly, everything else -> index.html."""
+        candidate = os.path.normpath(os.path.join(_FRONTEND_DIST, full_path))
+        if (
+            full_path
+            and candidate.startswith(_FRONTEND_DIST)
+            and os.path.isfile(candidate)
+        ):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(_FRONTEND_DIST, "index.html"))

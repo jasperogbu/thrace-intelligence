@@ -1,0 +1,30 @@
+# Render blueprint — single free web service serving API + frontend.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: thrace
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: >
+      pip install -r backend/requirements.txt &&
+      cd frontend && npm ci && npm run build
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT --app-dir backend
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: NODE_VERSION
+        value: 22.4.0
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FIRECRAWL_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: AUTH_SECRET
+        generateValue: true

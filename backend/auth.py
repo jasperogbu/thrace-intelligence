@@ -30,7 +30,11 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 # Frontend origin — the OAuth popup posts a message back to this origin.
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+# In production (Render) the app is served from the same origin as the API,
+# so RENDER_EXTERNAL_URL wins; locally it defaults to the Vite dev server.
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "") or os.getenv(
+    "RENDER_EXTERNAL_URL", "http://localhost:5173"
+)
 
 # Anti-forgery state per browser (single-slot; this app has one user per browser)
 _oauth_state: str | None = None
