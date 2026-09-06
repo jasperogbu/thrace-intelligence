@@ -30,7 +30,11 @@ import store
 from scheduler import scheduler
 
 # Serve the built frontend in production (single-service deployment).
-_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+# NOTE: normpath is essential — the raw join contains "backend/../frontend"
+# which would never match the normalized candidate path in the SPA fallback.
+_FRONTEND_DIST = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+)
 
 
 @asynccontextmanager
