@@ -28,3 +28,7 @@ services:
         sync: false
       - key: AUTH_SECRET
         generateValue: true
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
