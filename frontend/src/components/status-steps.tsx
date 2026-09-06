@@ -1,10 +1,10 @@
-import { Check, LoaderCircle } from "lucide-react"
+import { Check } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 const PIPELINE = [
-  { id: 0, label: "Searching the web" },
-  { id: 1, label: "Synthesising insights" },
-  { id: 2, label: "Formatting report" },
+  { id: 0, label: "SEARCH", desc: "scanning the live web" },
+  { id: 1, label: "REASON", desc: "agents weighing the evidence" },
+  { id: 2, label: "REPORT", desc: "formatting the brief" },
 ]
 
 interface StatusStepsProps {
@@ -13,54 +13,34 @@ interface StatusStepsProps {
 }
 
 export function StatusSteps({ label, detail }: StatusStepsProps) {
-  const activeIndex = PIPELINE.findIndex((s) => label.toLowerCase().includes(s.label.toLowerCase().split(" ")[0]))
+  const activeIndex = PIPELINE.findIndex((s) =>
+    label.toLowerCase().includes(s.label.toLowerCase()),
+  )
 
   return (
-    <div className="mx-auto w-full max-w-md space-y-2.5">
+    <div className="w-full max-w-md space-y-1.5 border border-border/70 bg-card/40 p-4 font-mono">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-data-sm text-primary">PROCESS</span>
+        <span className="cursor-blink size-1.5 bg-primary" aria-hidden />
+      </div>
       {PIPELINE.map((step, i) => {
-        const active = activeIndex === i || (activeIndex === -1 && i === 0)
+        const active = activeIndex === i
         const done = activeIndex !== -1 ? i < activeIndex : false
         return (
           <div
             key={step.id}
             className={cn(
-              "flex items-center gap-3 rounded-xl border px-4 py-3 transition-all duration-300",
-              done
-                ? "border-border/60 bg-background/40"
-                : active
-                  ? "border-violet-500/30 bg-violet-500/[0.06]"
-                  : "border-border/40 bg-background/20 opacity-50",
+              "flex items-center gap-3 py-1 text-[13px] transition-colors",
+              done ? "text-muted-foreground" : active ? "text-foreground" : "text-muted-foreground/40",
             )}
           >
-            <div
-              className={cn(
-                "flex size-6 shrink-0 items-center justify-center rounded-full border transition-colors",
-                done
-                  ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-500"
-                  : active
-                    ? "border-violet-500/40 bg-violet-500/15 text-violet-500"
-                    : "border-border text-muted-foreground",
-              )}
-            >
-              {done ? (
-                <Check className="size-3.5" />
-              ) : active ? (
-                <LoaderCircle className="size-3.5 animate-spin" />
-              ) : (
-                <span className="size-1.5 rounded-full bg-muted-foreground/40" />
-              )}
-            </div>
-            <div className="flex-1">
-              <p
-                className={cn(
-                  "text-sm font-medium",
-                  done ? "text-muted-foreground" : "text-foreground",
-                )}
-              >
-                {step.label}
-              </p>
-              {active && <p className="mt-0.5 text-xs text-muted-foreground">{detail}</p>}
-            </div>
+            <span className={cn("w-6 text-right", done ? "text-emerald-500" : active ? "text-primary" : "")}>
+              {done ? <Check className="ml-auto size-3.5" /> : active ? "▸" : "·"}
+            </span>
+            <span className="w-14">{step.label}</span>
+            <span className="truncate text-xs text-muted-foreground">
+              {active ? detail || step.desc : ""}
+            </span>
           </div>
         )
       })}

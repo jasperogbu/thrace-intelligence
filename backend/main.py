@@ -1,29 +1,48 @@
 """
-JASPA backend API.
+Thrace backend API.
 
 FastAPI server that exposes the multi-agent intelligence engine over HTTP with
-Server-Sent Events (SSE) streaming.
+Server-Sent Events (SSE) streaming, plus server-side persistence, an
+autonomous scheduler (watchlist re-validation + in-app digests), opportunity
+discovery and report Q&A.
 """
 import json
 import os
 import queue
 import threading
+import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
-
-import agents
+from urllib.parse import urlencode
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
+import agents
+import auth
+import scheduler as sched
+import store
+from scheduler import scheduler
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    store.init_db()
+    scheduler.start()
+    yield
+    scheduler.stop()
+
+
 app = FastAPI(
-    title="JASPA API",
+    title="Thrace API",
     description="Autonomous Startup Intelligence Platform - multi-agent API",
-    version="1.0.0",
+    version="1.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -43,12 +62,29 @@ class AnalyzeRequest(BaseModel):
     analysis_type: str = "competitor"
 
 
+class VentureRequest(BaseModel):
+    idea: str
+
+
 class HealthResponse(BaseModel):
     status: str
     model: Optional[str] = None
     agents: Optional[list[str]] = None
+    pipelines: Optional[list[str]] = None
+    features: Optional[list[str]] = None
     ready: bool
     error: Optional[str] = None
+
+
+AUTONOMOUS_FEATURES = [
+    "persistence",
+    "watchlist_revalidation",
+    "in_app_digest",
+    "self_critique",
+    "adaptive_research",
+    "opportunity_discovery",
+    "report_qa",
+]
 
 
 @app.get("/api/health", response_model=HealthResponse)
@@ -58,6 +94,8 @@ def health() -> HealthResponse:
         status="ok",
         model=status["model"],
         agents=status["agents"],
+        pipelines=status["pipelines"],
+        features=AUTONOMOUS_FEATURES,
         ready=status["ready"],
         error=status["error"],
     )
@@ -80,29 +118,29 @@ def analyze(req: AnalyzeRequest):
     if not status["ready"]:
         raise HTTPException(
             status_code=503,
-            detail="JASPA is not ready. Configure OPENAI_API_KEY and FIRECRAWL_API_KEY in .env",
+            detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
         )
 
     def generate():
         q: queue.Queue = queue.Queue()
 
-        def emit(event_type: str, data):
-            q.put({"type": event_type, "data": data})
+        def emit(event_type: str, **fields):
+            q.put({"type": event_type, **fields})
 
         def worker():
             try:
-                emit("status", {"label": "Searching the web", "detail": f"Scanning live sources for {company}..."})
+                emit("status", label="Searching the web", detail=f"Scanning live sources for {company}...")
                 bullets = agents.run_bullets(analysis_type, company)
 
-                emit("status", {"label": "Synthesising insights", "detail": "Agents are reasoning over the gathered evidence..."})
-                emit("stage_start", {"stage": "report"})
+                emit("status", label="Synthesising insights", detail="Agents are reasoning over the gathered evidence...")
+                emit("stage_start", stage="report", label="Report")
 
-                for delta in agents.stream_report(analysis_type, company, bullets):
-                    emit("delta", delta)
+                for event in agents.stream_report(analysis_type, company, bullets):
+                    q.put(event)
 
-                emit("done", {})
+                emit("done")
             except Exception as exc:  # noqa: BLE001
-                emit("error", {"message": str(exc)})
+                emit("error", message=str(exc))
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -125,4 +163,392 @@ def analyze(req: AnalyzeRequest):
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@app.post("/api/venture")
+def venture(req: VentureRequest):
+    """Run the Venture Intelligence pipeline for a business idea (SSE stream)."""
+    idea = req.idea.strip()
+
+    if not idea:
+        raise HTTPException(status_code=400, detail="A business idea is required.")
+    if len(idea) > 500:
+        raise HTTPException(status_code=400, detail="Idea must be under 500 characters.")
+
+    status = agents.team_status()
+    if not status["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
+        )
+
+    def generate():
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                for event in agents.run_venture_pipeline(idea):
+                    q.put(event)
+                q.put({"type": "done"})
+            except Exception as exc:  # noqa: BLE001
+                q.put({"type": "error", "message": str(exc)})
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        try:
+            while thread.is_alive() or not q.empty():
+                try:
+                    item = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            thread.join(timeout=2)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+class RegisterRequest(BaseModel):
+    email: str
+    name: str = ""
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/auth/register")
+def api_register(req: RegisterRequest):
+    return auth.register(req.email, req.name, req.password)
+
+
+@app.post("/api/auth/login")
+def api_login(req: LoginRequest):
+    return auth.login(req.email, req.password)
+
+
+@app.get("/api/auth/me")
+def api_me(user: dict | None = Depends(auth.resolve_user)):
+    if user is None:
+        return {"user": None}
+    return {"user": user}
+
+
+# --- Google OAuth -----------------------------------------------------------
+@app.get("/api/auth/google/url")
+def google_auth_url(request: Request):
+    """Return the Google consent-screen URL for a popup sign-in."""
+    if not auth.google_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Google sign-in is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.",
+        )
+    base = str(request.base_url).rstrip("/")
+    params = {
+        "client_id": auth.GOOGLE_CLIENT_ID,
+        "redirect_uri": f"{base}/api/auth/google/callback",
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "online",
+        "prompt": "select_account",
+        "state": auth.new_oauth_state(),
+    }
+    return {"url": f"{auth.GOOGLE_AUTH_URL}?{urlencode(params)}"}
+
+
+@app.get("/api/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """Google redirects here; hand the session token to the opener via postMessage."""
+    frontend = auth.FRONTEND_ORIGIN.rstrip("/")
+    if error or not code:
+        return RedirectResponse(f"{frontend}/auth?google_error=denied", status_code=302)
+    if not auth.check_oauth_state(state):
+        return RedirectResponse(f"{frontend}/auth?google_error=state", status_code=302)
+    base = str(request.base_url).rstrip("/")
+    try:
+        google_user = auth.exchange_google_code(code, f"{base}/api/auth/google/callback")
+        user = auth._upsert_google_user(google_user)
+        token = auth._make_token(user["id"])
+    except HTTPException as exc:
+        return RedirectResponse(
+            f"{frontend}/auth?google_error={urlencode(str(exc.detail))}", status_code=302
+        )
+    html = (
+        "<!doctype html><html><body><script>"
+        f"window.opener.postMessage({json.dumps({'type': 'thrace_google_auth', 'user': user, 'token': token})}, '{frontend}');"
+        "window.close();"
+        "</script></body></html>"
+    )
+    return HTMLResponse(html)
+
+
+# ---------------------------------------------------------------------------
+# Persistence sync + autonomous updates (user-scoped when signed in)
+# ---------------------------------------------------------------------------
+class SyncExchange(BaseModel):
+    id: str
+    query: str
+    mode: str
+    content: str = ""
+    status: str = "done"
+    timestamp: float
+
+
+class SyncRequest(BaseModel):
+    run: dict
+    exchange: SyncExchange
+
+
+@app.post("/api/runs/sync")
+def sync_run(req: SyncRequest, user: dict | None = Depends(auth.resolve_user)):
+    """Upsert a completed chat exchange from the client (fire-and-forget)."""
+    user_id = user["id"] if user else None
+    store.upsert_run(
+        {
+            "id": req.run.get("id"),
+            "user_id": user_id,
+            "query": req.run.get("query", ""),
+            "mode": req.run.get("mode", "venture"),
+            "pinned": req.run.get("pinned", False),
+            "created_at": req.run.get("timestamp", time.time()) / 1000,
+        }
+    )
+    store.upsert_exchange(
+        {
+            "id": req.exchange.id,
+            "run_id": req.run.get("id"),
+            "idx": int(req.run.get("exchangeCount", 0)),
+            "kind": "user",
+            "query": req.exchange.query,
+            "mode": req.exchange.mode,
+            "content": req.exchange.content,
+            "status": req.exchange.status,
+            "created_at": req.exchange.timestamp / 1000,
+        }
+    )
+    return {"ok": True}
+
+
+@app.get("/api/chats")
+def list_chats(user: dict | None = Depends(auth.resolve_user)):
+    """Full chat history for the signed-in user (empty for anonymous)."""
+    user_id = user["id"] if user else None
+    return {"chats": store.list_chats(user_id)}
+
+
+@app.delete("/api/chats/{run_id}")
+def delete_chat(run_id: str, user: dict | None = Depends(auth.resolve_user)):
+    user_id = user["id"] if user else None
+    store.delete_run(run_id, user_id)
+    return {"ok": True, "deleted": run_id}
+
+
+class PinRequest(BaseModel):
+    pinned: bool
+
+
+@app.patch("/api/chats/{run_id}/pin")
+def set_chat_pin(run_id: str, req: PinRequest, user: dict = Depends(auth.require_user)):
+    store.set_run_pin(run_id, req.pinned, user["id"])
+    return {"ok": True, "pinned": req.pinned}
+
+
+@app.get("/api/updates")
+def updates(since: float = 0, user: dict | None = Depends(auth.resolve_user)):
+    """Server-originated exchanges (monitor/digest) newer than `since` (epoch s)."""
+    user_id = user["id"] if user else None
+    return {"updates": store.server_updates_since(since, user_id)}
+
+
+# ---------------------------------------------------------------------------
+# Watchlist
+# ---------------------------------------------------------------------------
+class WatchRequest(BaseModel):
+    run_id: str
+    query: str
+    mode: str
+    interval_hours: Optional[float] = None
+
+
+@app.get("/api/watchlist")
+def get_watchlist(user: dict | None = Depends(auth.resolve_user)):
+    user_id = user["id"] if user else None
+    return {
+        "watching": [
+            {
+                "run_id": w["run_id"],
+                "query": w["query"],
+                "mode": w["mode"],
+                "interval_hours": w["interval_hours"],
+                "last_run": w["last_run"],
+            }
+            for w in store.list_watch(user_id)
+        ]
+    }
+
+
+@app.post("/api/watchlist")
+def add_watch(req: WatchRequest, user: dict | None = Depends(auth.resolve_user)):
+    user_id = user["id"] if user else None
+    store.add_watch(req.run_id, req.query, req.mode, req.interval_hours, user_id)
+    return {"ok": True, "watching": req.run_id}
+
+
+@app.delete("/api/watchlist/{run_id}")
+def remove_watch(run_id: str, user: dict | None = Depends(auth.resolve_user)):
+    user_id = user["id"] if user else None
+    store.remove_watch(run_id, user_id)
+    return {"ok": True, "removed": run_id}
+
+
+@app.post("/api/digest/run")
+def run_digest_now():
+    """Manually trigger one scheduler cycle (re-validations + digest)."""
+    result = sched.scheduler.run_once()
+    return {"ok": True, "result": result}
+
+
+# ---------------------------------------------------------------------------
+# Discover scan persistence (per-user, survives logout/login until cleared)
+# ---------------------------------------------------------------------------
+class DiscoverScanRequest(BaseModel):
+    focus: str = ""
+    log: str = ""
+    ideas: list[dict] = []
+
+
+@app.get("/api/discover/scan")
+def get_discover_scan(user: dict = Depends(auth.require_user)):
+    scan = store.get_discover_scan(user["id"])
+    if not scan:
+        return {"scan": None}
+    import json as _json
+
+    return {
+        "scan": {
+            "focus": scan["focus"],
+            "log": scan["log"],
+            "ideas": _json.loads(scan["ideas"] or "[]"),
+            "updated_at": scan["updated_at"],
+        }
+    }
+
+
+@app.post("/api/discover/scan")
+def save_discover_scan(req: DiscoverScanRequest, user: dict = Depends(auth.require_user)):
+    store.save_discover_scan(user["id"], req.focus, req.log, json.dumps(req.ideas))
+    return {"ok": True}
+
+
+@app.delete("/api/discover/scan")
+def clear_discover_scan(user: dict = Depends(auth.require_user)):
+    store.clear_discover_scan(user["id"])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Opportunity discovery (SSE)
+# ---------------------------------------------------------------------------
+class DiscoverRequest(BaseModel):
+    focus: str = ""
+
+
+@app.post("/api/discover")
+def discover(req: DiscoverRequest):
+    focus = req.focus.strip()
+    if len(focus) > 300:
+        raise HTTPException(status_code=400, detail="Focus must be under 300 characters.")
+    status = agents.team_status()
+    if not status["ready"]:
+        raise HTTPException(status_code=503, detail="Thrace is not ready.")
+
+    def generate():
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                for event in agents.run_discovery(focus):
+                    q.put(event)
+            except Exception as exc:  # noqa: BLE001
+                q.put({"type": "error", "message": str(exc)})
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            while thread.is_alive() or not q.empty():
+                try:
+                    item = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            thread.join(timeout=2)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report Q&A (SSE)
+# ---------------------------------------------------------------------------
+class AskRequest(BaseModel):
+    content: str
+    question: str
+
+
+@app.post("/api/ask")
+def ask(req: AskRequest):
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="A question is required.")
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="No report content to query.")
+    status = agents.team_status()
+    if not status["ready"]:
+        raise HTTPException(status_code=503, detail="Thrace is not ready.")
+
+    def generate():
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                for event in agents.answer_question(req.content, question):
+                    q.put(event)
+            except Exception as exc:  # noqa: BLE001
+                q.put({"type": "error", "message": str(exc)})
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            while thread.is_alive() or not q.empty():
+                try:
+                    item = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            thread.join(timeout=2)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )

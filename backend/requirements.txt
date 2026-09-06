@@ -3,4 +3,8 @@ uvicorn[standard]
 agno>=3
 firecrawl
 openai
+google-genai
 python-dotenv
+bcrypt
+pyjwt
+httpx

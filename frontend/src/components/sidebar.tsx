@@ -1,115 +1,404 @@
-import { Compass, Gauge, MessageSquareHeart, Plus } from "lucide-react"
-import { Button } from "@/components/ui/button"
+import { useState } from "react"
+import {
+  Compass,
+  Library,
+  LogOut,
+  PanelLeft,
+  Pin,
+  PinOff,
+  Plus,
+  Search,
+  Settings,
+  Telescope,
+  Trash2,
+  User,
+} from "lucide-react"
+import { toast } from "sonner"
 import { Logo } from "@/components/logo"
-import { ScrollArea } from "@/components/ui/scroll-area"
-import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
-import { ANALYSIS_LABELS, type AnalysisType } from "@/lib/api"
-
-const MODES: { id: AnalysisType; icon: React.ElementType }[] = [
-  { id: "competitor", icon: Compass },
-  { id: "sentiment", icon: MessageSquareHeart },
-  { id: "metrics", icon: Gauge },
-]
+import type { RunMode } from "@/lib/api"
 
 export interface HistoryItem {
   id: string
-  company: string
-  type: AnalysisType
+  query: string
+  mode: RunMode
   timestamp: number
+  content?: string
+  pinned?: boolean
 }
+
+export type View = "landing" | "workspace" | "library" | "explore" | "discover" | "settings"
 
 interface SidebarProps {
-  mode: AnalysisType
-  onModeChange: (mode: AnalysisType) => void
+  expanded: boolean
+  onToggle: () => void
+  view: View
+  activeId: string | null
   history: HistoryItem[]
+  user: { id: string; email: string; name: string } | null
+  onNewChat: () => void
+  onOpenAuth: () => void
+  onLogout: () => void
+  onOpenLibrary: () => void
+  onOpenExplore: () => void
+  onOpenDiscover: () => void
+  onOpenSettings: () => void
   onSelect: (item: HistoryItem) => void
-  onNew: () => void
+  onDelete: (id: string) => void
+  onTogglePin: (id: string) => void
+}
+const DAY = 86_400_000
+
+function groupOf(ts: number): "Today" | "Yesterday" | "Previous 7 days" | "Older" {
+  const now = new Date()
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  if (ts >= startToday) return "Today"
+  if (ts >= startToday - DAY) return "Yesterday"
+  if (ts >= startToday - 7 * DAY) return "Previous 7 days"
+  return "Older"
 }
 
-export function Sidebar({ mode, onModeChange, history, onSelect, onNew }: SidebarProps) {
+const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 days", "Older"] as const
+
+export function Sidebar({
+  expanded,
+  onToggle,
+  view,
+  activeId,
+  history,
+  user,
+  onNewChat,
+  onOpenAuth,
+  onLogout,
+  onOpenLibrary,
+  onOpenExplore,
+  onOpenDiscover,
+  onOpenSettings,
+  onSelect,
+  onDelete,
+  onTogglePin,
+}: SidebarProps) {
+  const [search, setSearch] = useState("")
+
+  const q = search.trim().toLowerCase()
+  const filtered = q
+    ? history.filter(
+        (h) =>
+          h.query.toLowerCase().includes(q) ||
+          (h.content ?? "").toLowerCase().includes(q),
+      )
+    : history
+
+  const groups = q
+    ? [{ label: `Results (${filtered.length})`, items: filtered }]
+    : [
+        {
+          label: "Pinned",
+          items: filtered.filter((i) => i.pinned),
+        },
+        ...GROUP_ORDER.map((g) => ({
+          label: g,
+          items: filtered.filter((i) => !i.pinned && groupOf(i.timestamp) === g),
+        })),
+      ].filter((g) => g.items.length > 0)
+
+  const navBtn = (active: boolean) =>
+    cn(
+      "flex items-center border border-transparent font-mono text-xs tracking-wide transition-colors hover:bg-card hover:text-foreground",
+      expanded ? "w-full justify-start gap-2 px-2.5 py-2" : "w-full justify-center py-2",
+      active ? "text-primary" : "text-muted-foreground",
+    )
+
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-border/70 bg-card/40 backdrop-blur-xl">
-      <div className="flex items-center justify-between px-4 py-4">
-        <Logo />
-      </div>
-
-      <div className="px-3">
-        <Button
-          variant="outline"
-          className="w-full justify-start gap-2 border-dashed"
-          onClick={onNew}
-        >
-          <Plus className="size-4" />
-          New analysis
-        </Button>
-      </div>
-
-      <div className="mt-4 px-3">
-        <p className="px-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-          Analysis type
-        </p>
-        <div className="mt-2 space-y-1">
-          {MODES.map((m) => (
+    <aside
+      className={cn(
+        "flex h-full w-full shrink-0 flex-col border-r border-border/70 bg-sidebar transition-[width] duration-200 ease-in-out md:transition-none",
+        expanded ? "md:w-64" : "md:w-14",
+      )}
+    >
+      {/* Brand + collapse toggle */}
+      <div
+        className={cn(
+          "group/brand flex h-[57px] items-center border-b border-border/60 px-3",
+          expanded ? "justify-between" : "relative justify-center px-0",
+        )}
+      >
+        {expanded ? (
+          <Logo textOnly />
+        ) : (
+          <>
+            <img
+              src="/thrace.png"
+              alt="Thrace"
+              className="size-6 rounded-sm object-cover transition-opacity group-hover/brand:opacity-0 brightness-[0.65]"
+              draggable={false}
+            />
             <button
-              key={m.id}
               type="button"
-              onClick={() => onModeChange(m.id)}
-              className={cn(
-                "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
-                mode === m.id
-                  ? "bg-foreground text-background"
-                  : "text-muted-foreground hover:bg-muted hover:text-foreground",
-              )}
+              onClick={onToggle}
+              aria-label="Expand sidebar"
+              title="Expand sidebar"
+              className="absolute inset-0 m-auto flex size-7 items-center justify-center rounded-sm text-muted-foreground opacity-0 transition-opacity hover:bg-card hover:text-foreground group-hover/brand:opacity-100"
             >
-              <m.icon className="size-4" />
-              {ANALYSIS_LABELS[m.id]}
+              <PanelLeft className="size-4" />
             </button>
-          ))}
-        </div>
-      </div>
+          </>
+        )}
+        {expanded && (
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-label="Collapse sidebar"
+            title="Collapse sidebar"
+            className="flex size-7 items-center justify-center text-muted-foreground transition-colors hover:bg-card hover:text-foreground"
+          >
+            <PanelLeft className="size-4" />
+          </button>
+        )}      </div>
 
-      <Separator className="my-4" />
-
-      <div className="min-h-0 flex-1 px-3">
-        <p className="px-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-          History
-        </p>
-        <ScrollArea className="mt-2 h-[calc(100%-1.5rem)]">
-          {history.length === 0 ? (
-            <p className="px-1 py-2 text-xs text-muted-foreground/60">
-              No analyses yet. Your reports will appear here.
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {history.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => onSelect(item)}
-                  className="w-full rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-muted"
-                >
-                  <p className="truncate text-sm text-foreground">{item.company}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {ANALYSIS_LABELS[item.type]}
-                    {" · "}
-                    {new Date(item.timestamp).toLocaleTimeString([], {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </p>
-                </button>
-              ))}
-            </div>
+      {/* Actions */}
+      <div className={cn("pt-3", expanded ? "px-3" : "px-2")}>
+        <button
+          type="button"
+          onClick={onNewChat}
+          title="New chat"
+          className={cn(
+            "flex items-center border border-border/70 bg-card/40 font-mono text-xs tracking-wide transition-colors hover:border-primary/40 hover:bg-card",
+            expanded ? "w-full justify-start gap-2 px-2.5 py-2" : "w-full justify-center py-2",
+            view === "landing" && !activeId ? "text-primary" : "text-foreground",
           )}
-        </ScrollArea>
+        >
+          <Plus className="size-4 shrink-0" />
+          {expanded && <span>new_chat()</span>}
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenLibrary}
+          title="Library"
+          className={cn(navBtn(view === "library"), "mt-1")}
+        >
+          <Library className="size-4 shrink-0" />
+          {expanded && <span>library()</span>}
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenExplore}
+          title="Explore"
+          className={cn(navBtn(view === "explore"), "mt-1")}
+        >
+          <Compass className="size-4 shrink-0" />
+          {expanded && <span>explore()</span>}
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenDiscover}
+          title="Discover — agents scan live signals and propose ideas"
+          className={cn(navBtn(view === "discover"), "mt-1")}
+        >
+          <Telescope className="size-4 shrink-0" />
+          {expanded && <span>discover()</span>}
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          title="Settings"
+          className={cn(navBtn(view === "settings"), "mt-1")}
+        >
+          <Settings className="size-4 shrink-0" />
+          {expanded && <span>settings()</span>}
+        </button>
       </div>
 
-      <div className="border-t border-border/70 px-4 py-3">
-        <p className="text-[11px] leading-relaxed text-muted-foreground/70">
-          JASPA · XVII MAY LTD · © 2026
-        </p>
+      {/* Recent */}
+      {expanded ? (
+        <>
+          <div className="mt-4 border-t border-border/60" />
+          <div className="flex min-h-0 flex-1 flex-col px-3 pt-3">
+            <div className="flex items-center gap-2 border border-border/70 bg-card/40 px-2 py-1.5 focus-within:border-primary/40">
+              <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="search history…"
+                className="w-full bg-transparent font-mono text-xs text-foreground outline-none placeholder:text-muted-foreground/50"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {search && (
+                <button
+                  type="button"
+                  onClick={() => setSearch("")}
+                  aria-label="Clear search"
+                  className="text-data-sm shrink-0 text-muted-foreground/60 hover:text-foreground"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+
+            <div className="scrollbar-hide mt-2 min-h-0 flex-1 overflow-y-auto">
+              {groups.length === 0 ? (
+                <p className="px-1 py-2 font-mono text-xs text-muted-foreground/50">
+                  {q ? "no_matches" : "no_chats_yet"}
+                </p>
+              ) : (
+                <div className="space-y-3 pb-2">
+                  {groups.map((group) => (
+                    <div key={group.label}>
+                      <p className="text-data-sm px-1 text-muted-foreground/70">
+                        {group.label}
+                      </p>
+                      <div className="mt-1 space-y-0.5">
+                        {group.items.map((item) => {
+                          const active = view === "workspace" && item.id === activeId
+                          return (
+                            <div key={item.id} className="group relative">
+                              <button
+                                type="button"
+                                onClick={() => onSelect(item)}
+                                className={cn(
+                                  "w-full border-l-2 px-2.5 py-2 pr-14 text-left transition-colors",
+                                  active
+                                    ? "border-primary bg-primary/[0.08]"
+                                    : "border-transparent hover:border-primary/40 hover:bg-card",
+                                )}
+                              >
+                                <p className="flex items-center gap-1 truncate text-[13px] text-foreground">
+                                  <span className="truncate">{item.query}</span>
+                                  {item.pinned && (
+                                    <Pin className="size-2.5 shrink-0 text-primary" />
+                                  )}
+                                </p>
+                                <p className="text-data-sm mt-0.5 text-muted-foreground">
+                                  <span className={active ? "text-primary" : ""}>
+                                    {item.mode === "venture"
+                                      ? "VENT"
+                                      : item.mode === "digest"
+                                        ? "DIGE"
+                                        : "COMP"}
+                                  </span>
+                                  {" · "}
+                                  {new Date(item.timestamp).toLocaleTimeString([], {
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                  })}
+                                </p>
+                              </button>
+
+                              <div className="absolute right-1 top-1.5 z-10 hidden items-center gap-0.5 group-hover:flex">
+                                <button
+                                  type="button"
+                                  aria-label={item.pinned ? "Unpin" : "Pin"}
+                                  title={item.pinned ? "Unpin" : "Pin"}
+                                  onClick={() => onTogglePin(item.id)}
+                                  className={cn(
+                                    "flex size-6 items-center justify-center hover:bg-card",
+                                    item.pinned
+                                      ? "text-primary"
+                                      : "text-muted-foreground hover:text-foreground",
+                                  )}
+                                >
+                                  {item.pinned ? (
+                                    <PinOff className="size-3.5" />
+                                  ) : (
+                                    <Pin className="size-3.5" />
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label="Delete"
+                                  title="Delete"
+                                  onClick={() => {
+                                    onDelete(item.id)
+                                    toast.success("Report deleted")
+                                  }}
+                                  className="flex size-6 items-center justify-center text-muted-foreground hover:bg-card hover:text-destructive"
+                                >
+                                  <Trash2 className="size-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="flex-1" />
+      )}
+
+      {/* User / account */}
+      <div
+        className={cn(
+          "border-t border-border/60",
+          expanded ? "px-3 py-3" : "flex justify-center px-0 py-3",
+        )}
+      >
+        {user ? (
+          <div className="flex items-center gap-2.5">
+            <div className="flex size-7 shrink-0 items-center justify-center rounded-full border border-primary/40 bg-primary/10 font-mono text-[11px] uppercase text-primary">
+              {(user.name || user.email).slice(0, 1)}
+            </div>
+            {expanded && (
+              <>
+                <div className="min-w-0 flex-1 leading-none">
+                  <p className="truncate text-[13px] text-foreground">
+                    {user.name || user.email.split("@")[0]}
+                  </p>
+                  <p className="text-data-sm mt-1 text-muted-foreground/70">
+                    synced account
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Sign out"
+                  title="Sign out"
+                  onClick={onLogout}
+                  className="flex size-7 items-center justify-center text-muted-foreground transition-colors hover:bg-card hover:text-destructive"
+                >
+                  <LogOut className="size-3.5" />
+                </button>
+              </>
+            )}
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={onOpenAuth}
+            title="Sign in or create an account"
+            className="flex items-center gap-2.5 transition-colors hover:text-foreground"
+          >
+            <div className="flex size-7 shrink-0 items-center justify-center border border-border/70 bg-card/60">
+              <User className="size-3.5 text-muted-foreground" />
+            </div>
+            {expanded && (
+              <div className="min-w-0 flex-1 text-left leading-none">
+                <p className="text-[13px] text-foreground">Guest</p>
+                <p className="text-data-sm mt-1 text-muted-foreground/70">
+                  sign in to sync →
+                </p>
+              </div>
+            )}
+          </button>
+        )}
       </div>
+
+      {expanded && (
+        <div className="border-t border-border/60 px-4 py-3">
+          <p className="text-data-sm text-muted-foreground/70">
+            Thrace · XVII MAY LTD · © 2026
+          </p>
+        </div>
+      )}
     </aside>
   )
 }
