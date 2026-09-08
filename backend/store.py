@@ -69,16 +69,29 @@ class _Conn:
         return False
 
 
+def _cols(cursor) -> list[str]:
+    """Column names for a cursor, normalised to lowercase.
+
+    The remote Turso (libsql) driver returns the description name of a
+    column literally called `query` as uppercase `QUERY`, while every other
+    column comes back as declared. Dicts built from such descriptions would
+    carry a "QUERY" key that callers reading ["query"] never find. SQLite
+    column names are case-insensitive, so lowercasing is always safe.
+    """
+    try:
+        names = [d[0] for d in cursor.description]
+    except (TypeError, IndexError):
+        return []
+    return [str(n).lower() for n in names]
+
+
 def _rows_to_dicts(cursor) -> list[dict]:
     """Materialise cursor rows as dicts (handles Row/tuple shapes)."""
     out = []
     cols = None
     for row in cursor.fetchall():
         if cols is None:
-            try:
-                cols = [d[0] for d in cursor.description]
-            except (TypeError, IndexError):
-                cols = [f"c{i}" for i in range(len(row))]
+            cols = _cols(cursor) or [f"c{i}" for i in range(len(row))]
         out.append(dict(zip(cols, row)))
     return out
 
@@ -87,10 +100,7 @@ def _one_to_dict(cursor) -> dict | None:
     row = cursor.fetchone()
     if row is None:
         return None
-    try:
-        cols = [d[0] for d in cursor.description]
-    except (TypeError, IndexError):
-        cols = [f"c{i}" for i in range(len(row))]
+    cols = _cols(cursor) or [f"c{i}" for i in range(len(row))]
     return dict(zip(cols, row))
 
 
