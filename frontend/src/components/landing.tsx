@@ -47,74 +47,79 @@ export function Landing({ onAnalyze }: LandingProps) {
       </div>
 
       {/* Pinned banner */}
-      <div className="z-10 flex shrink-0 items-center justify-center px-6 pt-12 pb-2">
-        <p className="text-data text-primary">
+      <div className="z-10 flex shrink-0 items-center justify-center px-6 pt-6 pb-2 sm:pt-12">
+        <p className="text-data text-center text-primary">
           // AUTONOMOUS STARTUP INTELLIGENCE
         </p>
       </div>
 
-      <main className="relative mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col items-center justify-center overflow-y-auto px-4 py-10 text-center sm:px-6 sm:py-16">
-        <h1 className="font-display text-4xl font-medium leading-[1.05] tracking-tight text-foreground sm:text-5xl">
-          {isVenture ? "Validate before you build." : "Research any company."}
-        </h1>
+      {/* `my-auto` on the inner block centres the content when there is room
+          and lets it scroll from the top when there is not — `justify-center`
+          alone clips the top of the content on short phone viewports. */}
+      <main className="relative flex min-h-0 w-full flex-1 flex-col overflow-y-auto px-4 py-6 sm:px-6 sm:py-10">
+        <div className="my-auto mx-auto w-full max-w-2xl text-center">
+          <h1 className="font-display text-3xl font-medium leading-[1.1] tracking-tight text-foreground sm:text-5xl sm:leading-[1.05]">
+            {isVenture ? "Validate before you build." : "Research any company."}
+          </h1>
 
-        {/* Mode toggle */}
-        <div className="mt-8 inline-flex max-w-full border border-border/70 bg-card/40 p-1">
-          {MODES.map((m) => (
-            <button
-              key={m.id}
-              type="button"
-              onClick={() => setTab(m.id)}
-              className={cn(
-                "flex-1 whitespace-nowrap px-3 py-1.5 font-mono text-xs tracking-wide transition-colors sm:px-4",
-                tab === m.id
-                  ? "bg-primary/[0.10] text-primary"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Input */}
-        <div className="mt-5 w-full">
-          <div className="flex items-end gap-2 border border-border bg-card/60 px-3 py-3 backdrop-blur focus-within:border-primary/50 focus-within:shadow-[0_0_0_1px] focus-within:shadow-primary/30 sm:gap-3 sm:px-4 sm:py-3.5">
-            <span className="pb-0.5 font-mono text-sm text-primary">&gt;</span>
-            <textarea
-              ref={taRef}
-              value={idea}
-              onChange={(e) => setIdea(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault()
-                  submit()
-                }
-              }}
-              placeholder={placeholder}
-              rows={1}
-              className="scrollbar-hide max-h-40 min-w-0 flex-1 resize-none bg-transparent text-left font-mono text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/60"
-              autoComplete="off"
-              spellCheck={false}
-              autoFocus
-            />
-            {idea.trim() && (
-              <span className="cursor-blink mb-1 h-4 w-2 shrink-0 bg-primary" aria-hidden />
-            )}
-            <Button
-              size="icon"
-              onClick={() => submit()}
-              disabled={!idea.trim() || busy}
-              className="size-9 shrink-0 border border-primary/40 bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-30 sm:size-8"
-            >
-              <ArrowUpRight className="size-4" />
-            </Button>
+          {/* Mode toggle */}
+          <div className="mt-6 flex w-full border border-border/70 bg-card/40 p-1 sm:mt-8 sm:inline-flex sm:w-auto sm:max-w-full">
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setTab(m.id)}
+                className={cn(
+                  "min-h-9 flex-1 whitespace-nowrap px-3 py-2 font-mono text-xs tracking-wide transition-colors sm:min-h-0 sm:px-4 sm:py-1.5",
+                  tab === m.id
+                    ? "bg-primary/[0.10] text-primary"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {m.label}
+              </button>
+            ))}
           </div>
-        </div>
 
-        <p className="text-data-sm mt-8 text-muted-foreground/50 sm:mt-10">
-          {isVenture ? "validate → market → compete → risk → plan" : "search → crawl → reason → report"}
-        </p>
+          {/* Input */}
+          <div className="mt-4 w-full sm:mt-5">
+            <div className="flex items-end gap-2 border border-border bg-card/60 px-3 py-3 backdrop-blur focus-within:border-primary/50 focus-within:shadow-[0_0_0_1px] focus-within:shadow-primary/30 sm:gap-3 sm:px-4 sm:py-3.5">
+              <span className="pb-0.5 font-mono text-sm text-primary">&gt;</span>
+              <textarea
+                ref={taRef}
+                value={idea}
+                onChange={(e) => setIdea(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault()
+                    submit()
+                  }
+                }}
+                placeholder={placeholder}
+                rows={1}
+                className="scrollbar-hide max-h-40 min-w-0 flex-1 resize-none bg-transparent text-left font-mono text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/60"
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus
+              />
+              {idea.trim() && (
+                <span className="cursor-blink mb-1 h-4 w-2 shrink-0 bg-primary" aria-hidden />
+              )}
+              <Button
+                size="icon"
+                onClick={() => submit()}
+                disabled={!idea.trim() || busy}
+                className="size-9 shrink-0 border border-primary/40 bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-30"
+              >
+                <ArrowUpRight className="size-4" />
+              </Button>
+            </div>
+          </div>
+
+          <p className="text-data-sm mt-6 text-muted-foreground/50 sm:mt-10">
+            {isVenture ? "validate → market → compete → risk → plan" : "search → crawl → reason → report"}
+          </p>
+        </div>
       </main>
     </div>
   )

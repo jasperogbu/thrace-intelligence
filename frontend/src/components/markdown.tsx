@@ -16,26 +16,26 @@ const components = {
     <h4 className="mb-2 mt-4 text-base font-medium text-foreground" {...props} />
   ),
   p: (props: React.ComponentPropsWithoutRef<"p">) => (
-    <p className="my-3 break-words text-[15px] leading-relaxed text-muted-foreground" {...props} />
+    <p className="my-3.5 break-words text-[15.5px] leading-7 text-foreground/85" {...props} />
   ),
   ul: (props: React.ComponentPropsWithoutRef<"ul">) => (
-    <ul className="my-3 list-disc space-y-1.5 pl-5 text-muted-foreground" {...props} />
+    <ul className="my-3.5 list-disc space-y-1.5 pl-5 text-foreground/85" {...props} />
   ),
   ol: (props: React.ComponentPropsWithoutRef<"ol">) => (
-    <ol className="my-3 list-decimal space-y-1.5 pl-5 text-muted-foreground" {...props} />
+    <ol className="my-3.5 list-decimal space-y-1.5 pl-5 text-foreground/85" {...props} />
   ),
   li: (props: React.ComponentPropsWithoutRef<"li">) => (
-    <li className="break-words leading-relaxed marker:text-primary" {...props} />
+    <li className="break-words leading-7 marker:text-primary" {...props} />
   ),
   blockquote: (props: React.ComponentPropsWithoutRef<"blockquote">) => (
     <blockquote
-      className="my-4 border-l-2 border-primary/40 pl-4 font-display text-lg italic text-foreground/80"
+      className="my-5 font-display text-[1.15rem] leading-relaxed italic text-foreground"
       {...props}
     />
   ),
   a: (props: React.ComponentPropsWithoutRef<"a">) => (
     <a
-      className="break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
+      className="break-words text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
       target="_blank"
       rel="noreferrer"
       {...props}
@@ -71,7 +71,7 @@ const components = {
     <th className="border-b border-border px-2 py-2 font-mono text-[11px] font-medium uppercase tracking-wider text-foreground sm:px-3" {...props} />
   ),
   td: (props: React.ComponentPropsWithoutRef<"td">) => (
-    <td className="border-b border-border/50 px-2 py-2 align-top text-muted-foreground last:border-0 sm:px-3" {...props} />
+    <td className="border-b border-border/50 px-2 py-2 align-top text-foreground/80 last:border-0 sm:px-3" {...props} />
   ),
 }
 

@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react"
 import {
   clearDiscoverScan,
+  DISCOVER_MAX_IDEAS,
   fetchDiscoverScan,
   saveDiscoverScan,
   streamDiscover,
@@ -55,7 +56,12 @@ export async function hydrateDiscover(user: User | null): Promise<void> {
   if (state.scanning) return // never clobber an in-flight scan
   const scan = await fetchDiscoverScan()
   if (scan && (scan.log || scan.ideas.length > 0)) {
-    set({ focus: scan.focus, log: scan.log, ideas: scan.ideas, error: null })
+    set({
+      focus: scan.focus,
+      log: scan.log,
+      ideas: scan.ideas.slice(0, DISCOVER_MAX_IDEAS),
+      error: null,
+    })
   } else {
     // Server is authoritative on hydration — show a clean slate.
     set({ focus: "", log: "", ideas: [], error: null })
@@ -89,7 +95,15 @@ export function startDiscoverScan() {
         set({ log: state.log + ev.data })
         break
       case "idea":
-        set({ ideas: [...state.ideas, { title: ev.title, prompt: ev.prompt, rationale: ev.rationale }] })
+        // The backend caps a scan at DISCOVER_MAX_IDEAS; guard here too so a
+        // duplicated or retried stream can't grow the list or the saved scan.
+        if (state.ideas.length >= DISCOVER_MAX_IDEAS) break
+        set({
+          ideas: [
+            ...state.ideas,
+            { title: ev.title, prompt: ev.prompt, rationale: ev.rationale },
+          ],
+        })
         break
       case "error":
         set({ error: ev.message })

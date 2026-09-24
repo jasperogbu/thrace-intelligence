@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# JASPA - one-command launcher
+# Thrace - one-command launcher
 # Starts the FastAPI backend + React frontend, then opens the app in your browser.
 
 set -e
@@ -22,12 +22,12 @@ if [ ! -d "$ROOT/frontend/node_modules" ]; then
   exit 1
 fi
 
-echo ">> Starting JASPA backend  (http://localhost:${BACKEND_PORT})"
+echo ">> Starting Thrace backend  (http://localhost:${BACKEND_PORT})"
 nohup "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port "$BACKEND_PORT" \
-  --app-dir "$ROOT/backend" > /tmp/jasper_backend.log 2>&1 &
+  --app-dir "$ROOT/backend" > /tmp/thrace_backend.log 2>&1 &
 
-echo ">> Starting JASPA frontend (http://localhost:${FRONTEND_PORT})"
-nohup npm run dev --prefix "$ROOT/frontend" > /tmp/jasper_frontend.log 2>&1 &
+echo ">> Starting Thrace frontend (http://localhost:${FRONTEND_PORT})"
+nohup npm run dev --prefix "$ROOT/frontend" > /tmp/thrace_frontend.log 2>&1 &
 
 echo ">> Waiting for services to come up..."
 
@@ -36,7 +36,7 @@ for i in $(seq 1 30); do
     echo "   backend  OK"
     break
   fi
-  [ "$i" -eq 30 ] && echo "   backend  did not start in time (see /tmp/jasper_backend.log)"
+  [ "$i" -eq 30 ] && echo "   backend  did not start in time (see /tmp/thrace_backend.log)"
   sleep 1
 done
 
@@ -45,7 +45,7 @@ for i in $(seq 1 30); do
     echo "   frontend OK"
     break
   fi
-  [ "$i" -eq 30 ] && echo "   frontend did not start in time (see /tmp/jasper_frontend.log)"
+  [ "$i" -eq 30 ] && echo "   frontend did not start in time (see /tmp/thrace_frontend.log)"
   sleep 1
 done
 
@@ -53,7 +53,7 @@ echo ">> Opening $URL"
 open "$URL" 2>/dev/null || true
 
 echo ""
-echo "JASPA is running."
+echo "Thrace is running."
 echo "  Frontend: $URL"
 echo "  Backend:  http://localhost:${BACKEND_PORT}/api/health"
 echo "  Stop:     $ROOT/stop.sh"

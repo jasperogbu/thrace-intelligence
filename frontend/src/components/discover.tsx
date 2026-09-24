@@ -10,6 +10,7 @@ import {
   startDiscoverScan,
   useDiscover,
 } from "@/lib/discover-store"
+import { DISCOVER_MAX_IDEAS } from "@/lib/api"
 
 interface DiscoverProps {
   onAnalyze: (query: string, mode: "venture") => void
@@ -25,6 +26,8 @@ export function DiscoverView({ onAnalyze, user }: DiscoverProps) {
   }, [user])
 
   const hasPreviousScan = !scanning && (log.length > 0 || ideas.length > 0)
+  // Defensive cap — the store already limits appends to DISCOVER_MAX_IDEAS.
+  const visibleIdeas = ideas.slice(0, DISCOVER_MAX_IDEAS)
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -88,55 +91,61 @@ export function DiscoverView({ onAnalyze, user }: DiscoverProps) {
         </div>
 
         {/* Live scan log */}
-        {log && (
-          <div className="mt-6 border-l-2 border-primary/40 bg-card/50 px-4 py-3">
+        {(scanning || log) && (
+          <div className="mt-6 border border-border/70 bg-card/40 px-4 py-3">
             <p className="mb-1 flex items-center gap-2 font-mono text-xs text-muted-foreground/60">
               agent scan output
               {scanning && <LoaderCircle className="size-3 animate-spin text-primary" />}
             </p>
             <div className="max-h-64 overflow-y-auto">
-              <Markdown className="text-xs">{log}</Markdown>
+              {log ? (
+                <Markdown className="text-xs">{log}</Markdown>
+              ) : (
+                <p className="font-mono text-xs text-muted-foreground/70">
+                  searching live signals…
+                </p>
+              )}
             </div>
           </div>
         )}
 
         {error && (
-          <div className="mt-6 border-l-2 border-destructive bg-destructive/10 px-4 py-3 font-mono text-sm text-destructive">
+          <div className="mt-6 border border-destructive/40 bg-destructive/[0.07] px-4 py-3 font-mono text-sm text-destructive">
             <p className="font-medium">scan_failed</p>
             <p className="mt-1 text-destructive/80">{error}</p>
           </div>
         )}
 
         {/* Idea cards */}
-        {ideas.length > 0 && (
+        {visibleIdeas.length > 0 && (
           <div className="mt-8">
             <p className="text-data-sm mb-3 text-muted-foreground">
-              {ideas.length} OPPORTUNITIES PROPOSED
+              {visibleIdeas.length}{" "}
+              {visibleIdeas.length === 1 ? "OPPORTUNITY" : "OPPORTUNITIES"} PROPOSED
             </p>
             <div className="grid gap-3 sm:grid-cols-2">
-              {ideas.map((idea) => (
+              {visibleIdeas.map((idea) => (
                 <div
                   key={idea.prompt}
-                  className="group border border-border/70 bg-card/40 p-4 transition-colors hover:border-primary/40 hover:bg-card/70"
+                  className="group flex flex-col border border-border/70 bg-card/40 p-4 transition-colors hover:border-primary/40 hover:bg-card/70"
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="text-[13px] font-medium text-foreground">{idea.title}</p>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => onAnalyze(idea.prompt, "venture")}
-                      className="shrink-0 gap-1 border-primary/40 font-mono text-[11px] text-primary hover:bg-primary hover:text-primary-foreground"
-                    >
-                      <ArrowUpRight className="size-3" />
-                      validate
-                    </Button>
-                  </div>
+                  <p className="text-[13px] font-medium text-foreground">{idea.title}</p>
                   <p className="mt-2 break-words border border-border/70 bg-background/60 px-2 py-1 font-mono text-[11px] leading-relaxed text-muted-foreground/80">
                     &gt; {idea.prompt}
                   </p>
                   <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
                     {idea.rationale}
                   </p>
+                  {/* Straight into the Venture Intelligence pipeline. */}
+                  <div className="mt-auto pt-4">
+                    <Button
+                      onClick={() => onAnalyze(idea.prompt, "venture")}
+                      className="w-full gap-1.5 border border-primary/40 bg-primary/10 font-mono text-xs tracking-wide text-primary hover:bg-primary hover:text-primary-foreground"
+                    >
+                      <ArrowUpRight className="size-3.5" />
+                      validate()
+                    </Button>
+                  </div>
                 </div>
               ))}
             </div>

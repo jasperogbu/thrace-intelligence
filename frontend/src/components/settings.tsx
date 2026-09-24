@@ -85,7 +85,7 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
         </h1>
 
         {/* System status */}
-        <section className="mt-8 border border-border/70 bg-card/40 p-5">
+        <section className="mt-8 border border-border/70 bg-card/40 p-4 sm:p-5">
           <p className="text-data-sm text-muted-foreground">SYSTEM STATUS</p>
           {healthError ? (
             <p className="mt-3 font-mono text-sm text-destructive">
@@ -93,24 +93,26 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
             </p>
           ) : health ? (
             <div className="mt-3 space-y-2 font-mono text-[13px]">
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">status</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">status</span>
                 <span className={health.ready ? "text-emerald-500" : "text-destructive"}>
                   {health.ready ? "● READY" : "● NOT READY"}
                 </span>
               </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">model</span>
-                <span className="text-foreground">{health.model ?? "—"}</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">model</span>
+                <span className="min-w-0 truncate text-right text-foreground">
+                  {health.model ?? "—"}
+                </span>
               </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">pipelines</span>
-                <span className="text-foreground">
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">pipelines</span>
+                <span className="min-w-0 truncate text-right text-foreground">
                   {health.pipelines?.join(" · ") ?? "—"}
                 </span>
               </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">agents</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">agents</span>
                 <span className="text-foreground">{health.agents?.length ?? "—"}</span>
               </div>
               {health.error && (
@@ -123,7 +125,7 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
         </section>
 
         {/* Agents */}
-        <section className="mt-4 border border-border/70 bg-card/40 p-5">
+        <section className="mt-4 border border-border/70 bg-card/40 p-4 sm:p-5">
           <p className="text-data-sm text-muted-foreground">AGENT ROSTER</p>
           <div className="mt-3 space-y-1.5">
             {(health?.agents ?? []).map((a, i) => (
@@ -141,7 +143,7 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
         </section>
 
         {/* Autonomous system */}
-        <section className="mt-4 border border-border/70 bg-card/40 p-5">
+        <section className="mt-4 border border-border/70 bg-card/40 p-4 sm:p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-data-sm text-muted-foreground">AUTONOMOUS SYSTEM</p>
@@ -176,7 +178,7 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
         </section>
 
         {/* Appearance */}
-        <section className="mt-4 border border-border/70 bg-card/40 p-5">
+        <section className="mt-4 border border-border/70 bg-card/40 p-4 sm:p-5">
           <p className="text-data-sm text-muted-foreground">APPEARANCE</p>
           <div className="mt-3 flex gap-2">
             {THEMES.map((t) => (
@@ -198,17 +200,19 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
         </section>
 
         {/* Account */}
-        <section className="mt-4 border border-border/70 bg-card/40 p-5">
+        <section className="mt-4 border border-border/70 bg-card/40 p-4 sm:p-5">
           <p className="text-data-sm text-muted-foreground">ACCOUNT</p>
           {user ? (
             <div className="mt-3 space-y-2 font-mono text-[13px]">
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">signed in as</span>
-                <span className="text-foreground">{user.name || user.email}</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">signed in as</span>
+                <span className="min-w-0 truncate text-right text-foreground">
+                  {user.name || user.email}
+                </span>
               </div>
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">email</span>
-                <span className="text-foreground">{user.email}</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-muted-foreground">email</span>
+                <span className="min-w-0 truncate text-right text-foreground">{user.email}</span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">sync</span>
@@ -224,7 +228,7 @@ export function SettingsView({ onClearHistory, runCount, watchedCount, user }: S
         </section>
 
         {/* Data */}
-        <section className="mt-4 border border-border/70 bg-card/40 p-5">
+        <section className="mt-4 border border-border/70 bg-card/40 p-4 sm:p-5">
           <p className="text-data-sm text-muted-foreground">DATA</p>
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
             <p className="font-mono text-[13px] text-muted-foreground">

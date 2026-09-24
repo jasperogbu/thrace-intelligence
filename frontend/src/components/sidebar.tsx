@@ -12,6 +12,7 @@ import {
   Telescope,
   Trash2,
   User,
+  X,
 } from "lucide-react"
 import { toast } from "sonner"
 import { Logo } from "@/components/logo"
@@ -31,6 +32,8 @@ export type View = "landing" | "workspace" | "library" | "explore" | "discover" 
 
 interface SidebarProps {
   expanded: boolean
+  /** Rendered inside the mobile drawer rather than as the desktop rail. */
+  isDrawer?: boolean
   onToggle: () => void
   view: View
   activeId: string | null
@@ -62,6 +65,7 @@ const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 days", "Older"] as const
 
 export function Sidebar({
   expanded,
+  isDrawer = false,
   onToggle,
   view,
   activeId,
@@ -105,7 +109,7 @@ export function Sidebar({
   const navBtn = (active: boolean) =>
     cn(
       "flex items-center border border-transparent font-mono text-xs tracking-wide transition-colors hover:bg-card hover:text-foreground",
-      expanded ? "w-full justify-start gap-2 px-2.5 py-2" : "w-full justify-center py-2",
+      expanded ? "w-full justify-start gap-2 px-2.5 py-2.5" : "w-full justify-center py-2.5",
       active ? "text-primary" : "text-muted-foreground",
     )
 
@@ -124,7 +128,21 @@ export function Sidebar({
         )}
       >
         {expanded ? (
-          <Logo textOnly />
+          <>
+            <Logo textOnly />
+            <button
+              type="button"
+              onClick={onToggle}
+              aria-label={isDrawer ? "Close navigation" : "Collapse sidebar"}
+              title={isDrawer ? "Close" : "Collapse sidebar"}
+              className={cn(
+                "flex items-center justify-center text-muted-foreground transition-colors hover:bg-card hover:text-foreground",
+                isDrawer ? "size-9" : "size-7",
+              )}
+            >
+              {isDrawer ? <X className="size-4" /> : <PanelLeft className="size-4" />}
+            </button>
+          </>
         ) : (
           <>
             <img
@@ -144,17 +162,7 @@ export function Sidebar({
             </button>
           </>
         )}
-        {expanded && (
-          <button
-            type="button"
-            onClick={onToggle}
-            aria-label="Collapse sidebar"
-            title="Collapse sidebar"
-            className="flex size-7 items-center justify-center text-muted-foreground transition-colors hover:bg-card hover:text-foreground"
-          >
-            <PanelLeft className="size-4" />
-          </button>
-        )}      </div>
+      </div>
 
       {/* Actions */}
       <div className={cn("pt-3", expanded ? "px-3" : "px-2")}>
@@ -164,7 +172,7 @@ export function Sidebar({
           title="New chat"
           className={cn(
             "flex items-center border border-border/70 bg-card/40 font-mono text-xs tracking-wide transition-colors hover:border-primary/40 hover:bg-card",
-            expanded ? "w-full justify-start gap-2 px-2.5 py-2" : "w-full justify-center py-2",
+            expanded ? "w-full justify-start gap-2 px-2.5 py-2.5" : "w-full justify-center py-2.5",
             view === "landing" && !activeId ? "text-primary" : "text-foreground",
           )}
         >
@@ -218,7 +226,7 @@ export function Sidebar({
         <>
           <div className="mt-4 border-t border-border/60" />
           <div className="flex min-h-0 flex-1 flex-col px-3 pt-3">
-            <div className="flex items-center gap-2 border border-border/70 bg-card/40 px-2 py-1.5 focus-within:border-primary/40">
+            <div className="flex items-center gap-2 border border-border/70 bg-card/40 px-2 py-2 focus-within:border-primary/40">
               <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
               <input
                 value={search}
@@ -261,17 +269,19 @@ export function Sidebar({
                                 type="button"
                                 onClick={() => onSelect(item)}
                                 className={cn(
-                                  "w-full border-l-2 px-2.5 py-2 pr-14 text-left transition-colors",
+                                  "w-full border-l-2 px-2.5 py-2.5 pr-16 text-left transition-colors",
                                   active
                                     ? "border-primary bg-primary/[0.08]"
                                     : "border-transparent hover:border-primary/40 hover:bg-card",
                                 )}
                               >
-                                <p className="flex items-center gap-1 truncate text-[13px] text-foreground">
-                                  <span className="truncate">{item.query}</span>
-                                  {item.pinned && (
-                                    <Pin className="size-2.5 shrink-0 text-primary" />
-                                  )}
+                                {/* No inline pin marker here: the chat already
+                                    sits under the "Pinned" heading, and the
+                                    action button shows the pinned state and
+                                    unpins it — a second pin icon just read as
+                                    a duplicate. */}
+                                <p className="truncate text-[13px] text-foreground">
+                                  {item.query}
                                 </p>
                                 <p className="text-data-sm mt-0.5 text-muted-foreground">
                                   <span className={active ? "text-primary" : ""}>
@@ -289,14 +299,14 @@ export function Sidebar({
                                 </p>
                               </button>
 
-                              <div className="absolute right-1 top-1.5 z-10 hidden items-center gap-0.5 group-hover:flex">
+                              <div className="absolute right-1 top-1/2 z-10 flex -translate-y-1/2 items-center gap-0.5 md:pointer-events-none md:opacity-0 md:transition-opacity md:group-hover:pointer-events-auto md:group-hover:opacity-100">
                                 <button
                                   type="button"
                                   aria-label={item.pinned ? "Unpin" : "Pin"}
                                   title={item.pinned ? "Unpin" : "Pin"}
                                   onClick={() => onTogglePin(item.id)}
                                   className={cn(
-                                    "flex size-6 items-center justify-center hover:bg-card",
+                                    "flex size-8 items-center justify-center hover:bg-card",
                                     item.pinned
                                       ? "text-primary"
                                       : "text-muted-foreground hover:text-foreground",
@@ -316,7 +326,7 @@ export function Sidebar({
                                     onDelete(item.id)
                                     toast.success("Report deleted")
                                   }}
-                                  className="flex size-6 items-center justify-center text-muted-foreground hover:bg-card hover:text-destructive"
+                                  className="flex size-8 items-center justify-center text-muted-foreground hover:bg-card hover:text-destructive"
                                 >
                                   <Trash2 className="size-3.5" />
                                 </button>
@@ -336,11 +346,13 @@ export function Sidebar({
         <div className="flex-1" />
       )}
 
-      {/* User / account */}
+      {/* User / account. Demarcated from the chat list by a deliberate gap
+          rather than a rule — the sidebar's own divider token is barely
+          visible on this background anyway. Roughly 64px of clear space. */}
       <div
         className={cn(
-          "border-t border-border/60",
-          expanded ? "px-3 py-3" : "flex justify-center px-0 py-3",
+          "shrink-0",
+          expanded ? "px-3 pb-3 pt-14" : "flex justify-center px-0 pb-3 pt-14",
         )}
       >
         {user ? (
@@ -393,7 +405,7 @@ export function Sidebar({
       </div>
 
       {expanded && (
-        <div className="border-t border-border/60 px-4 py-3">
+        <div className="hidden border-t border-border/60 px-4 py-3 md:block">
           <p className="text-data-sm text-muted-foreground/70">
             Thrace · XVII MAY LTD · © 2026
           </p>

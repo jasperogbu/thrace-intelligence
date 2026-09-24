@@ -122,7 +122,7 @@ export function LibraryView({ runs, onOpen, onNew, onDelete }: LibraryViewProps)
                     onDelete(run.id)
                     toast.success("Report deleted")
                   }}
-                  className="absolute right-1.5 top-1.5 z-10 hidden size-7 items-center justify-center text-muted-foreground hover:bg-card hover:text-destructive group-hover:flex"
+                  className="absolute right-1.5 top-1.5 z-10 flex size-8 items-center justify-center text-muted-foreground hover:bg-card hover:text-destructive md:pointer-events-none md:opacity-0 md:transition-opacity md:group-hover:pointer-events-auto md:group-hover:opacity-100"
                 >
                   <Trash2 className="size-4" />
                 </button>

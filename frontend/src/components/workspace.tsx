@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, ChevronLeft, Copy, Eye, EyeOff, LoaderCircle } from "lucide-react"
+import { Check, ChevronLeft, Copy, Eye, EyeOff, LoaderCircle, Menu, SquarePen } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Markdown } from "@/components/markdown"
@@ -36,9 +36,10 @@ interface WorkspaceProps {
   onRun: (query: string, mode: RunMode, appendToId?: string) => void
   onToggleWatch: (id: string) => void
   onNew: () => void
+  onMenu: () => void
 }
 
-export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWatch, onNew }: WorkspaceProps) {
+export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWatch, onNew, onMenu }: WorkspaceProps) {
   const [draft, setDraft] = useState("")
   const [copied, setCopied] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -63,14 +64,30 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
     if (el) el.scrollTop = el.scrollHeight
   }, [run?.content, run?.status, run?.statusLabel])
 
+  const isVentureMode = mode === "venture"
+  const hasReport = (run?.exchanges ?? []).some((e) => e.content.trim().length > 0)
+  // A chat keeps the nature of its first turn. Deriving the fallback from the
+  // report text alone meant a Company X-Ray whose first report came back empty
+  // was re-classified as a venture — so the next message was validated as a
+  // business idea instead of being asked about the company.
+  const chatMode: RunMode = !run || run.mode === "venture" ? "venture" : "competitor"
+  const effectiveMode: RunMode = mode === "ask" && !hasReport ? chatMode : mode
+
   const submit = () => {
     const value = draft.trim()
     const running = run?.status === "running"
     if (!value || running) return
     setDraft("")
+    // A chat with no completed report has nothing to answer from: re-run its
+    // own pipeline against the chat's original subject rather than treating
+    // the new text as a fresh idea or company.
+    if (run && !hasReport) {
+      toast.info(`No report yet — re-running the analysis for “${run.query}”`)
+      onRun(run.query, chatMode, run.id)
+      return
+    }
     // An open, idle chat continues in place; otherwise a new chat starts.
-    const continueId = run && !running ? run.id : undefined
-    onRun(value, effectiveMode, continueId)
+    onRun(value, effectiveMode, run ? run.id : undefined)
   }
 
   const copyReport = async () => {
@@ -84,17 +101,14 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
     setTimeout(() => setCopied(false), 1600)
   }
 
-  const isVentureMode = mode === "venture"
-  const hasReport = (run?.exchanges ?? []).some((e) => e.content.trim().length > 0)
-  const effectiveMode: RunMode = mode === "ask" && !hasReport ? "venture" : mode
-
-  // Once a chat holds a report, ASK becomes the default follow-up mode (the
-  // user can still switch to VENT / COMP explicitly).
+  // Once a chat holds a report, ASK becomes the default follow-up mode; before
+  // that the chat's own pipeline is the only sensible continuation (the user
+  // can still switch to VENT / COMP explicitly).
   useEffect(() => {
     if (hasReport && mode !== "ask") onModeChange("ask")
-    if (!hasReport && mode === "ask") onModeChange("venture")
+    if (!hasReport && mode === "ask") onModeChange(chatMode)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasReport, run?.id])
+  }, [hasReport, run?.id, chatMode])
 
   const placeholder =
     mode === "ask"
@@ -106,14 +120,30 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* Header */}
-      <header className="flex items-center gap-1 border-b border-border/70 px-2 py-2 sm:gap-3 sm:px-4 sm:py-2.5">
-        <Button variant="ghost" size="icon" onClick={onNew} aria-label="Back" className="size-8 shrink-0 sm:size-7">
+      <header className="flex items-center gap-1 border-b border-border/70 px-1.5 py-2 sm:gap-3 sm:px-4 sm:py-2.5">
+        {/* Mobile: navigation lives in a drawer. Desktop: back to a new chat. */}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onMenu}
+          aria-label="Open navigation"
+          className="size-9 shrink-0 md:hidden"
+        >
+          <Menu className="size-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onNew}
+          aria-label="Back"
+          className="hidden size-8 shrink-0 md:inline-flex"
+        >
           <ChevronLeft className="size-4" />
         </Button>
-        <div className="flex min-w-0 flex-1 items-center gap-2 font-mono text-[13px]">
-          <span className="text-muted-foreground/50">/</span>
-          <span className="truncate text-foreground">{run?.query ?? "—"}</span>
+        <div className="flex min-w-0 flex-1 items-center gap-2 px-1 font-mono text-[13px]">
           <span className="hidden text-muted-foreground/50 sm:inline">/</span>
+          <span className="min-w-0 truncate text-foreground">{run?.query ?? "—"}</span>
+          <span className="hidden shrink-0 text-muted-foreground/50 sm:inline">/</span>
           <span className="hidden shrink-0 text-primary sm:inline">
             {run
               ? modeLabelFor(run.mode).toUpperCase().replace(/ /g, "_")
@@ -134,7 +164,7 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
             variant="ghost"
             size="sm"
             className={cn(
-              "shrink-0 gap-1.5 px-2 font-mono text-xs",
+              "h-9 shrink-0 gap-1.5 px-3 font-mono text-xs sm:h-7 sm:px-2",
               watched ? "text-primary" : "text-muted-foreground",
             )}
             title={
@@ -152,84 +182,90 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
           <Button
             variant="ghost"
             size="sm"
-            className="shrink-0 gap-1.5 px-2 font-mono text-xs text-muted-foreground"
+            className="h-9 shrink-0 gap-1.5 px-3 font-mono text-xs text-muted-foreground sm:h-7 sm:px-2"
             onClick={copyReport}
           >
             {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             <span className="hidden sm:inline">{copied ? "copied" : "copy"}</span>
           </Button>
         )}
+        {/* Mobile only — on desktop the back arrow already returns to the
+            new-chat screen. Without this, starting a fresh chat meant opening
+            the drawer and using new_chat(). */}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onNew}
+          aria-label="New chat"
+          title="New chat"
+          className="size-9 shrink-0 text-muted-foreground md:hidden"
+        >
+          <SquarePen className="size-4" />
+        </Button>
       </header>
 
       {/* Body */}
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-4 sm:py-6">
-        <div className="mx-auto w-full max-w-3xl space-y-6">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6 sm:py-8">
+        <div className="mx-auto w-full max-w-3xl space-y-8">
           {!run ? (
             <EmptyState />
           ) : (
-            (run.exchanges ?? []).map((ex) => (
-              <div key={ex.id} className="space-y-6">
-                {/* Request line */}
-                <div className="flex justify-end">
-                  <div className="max-w-[85%] border border-primary/40 bg-primary/[0.06] px-3 py-2 font-mono text-[13px] sm:max-w-[80%] sm:px-4">
-                    <p className="break-words text-foreground">
-                      <span className="text-primary">&gt;</span> {ex.query}
-                    </p>
-                    <p className="text-data-sm mt-0.5 text-muted-foreground">
-                      {modeLabelFor(ex.mode)}
-                    </p>
+            (run.exchanges ?? []).map((ex) => {
+              const isFollowUp = ex.mode !== run.mode
+              return (
+                <div key={ex.id} className="space-y-4">
+                  {/* Request */}
+                  <div className="flex justify-end">
+                    <div className="max-w-[85%] bg-primary/[0.06] px-3 py-2 font-mono text-[13px] [overflow-wrap:anywhere]">
+                      <p className="break-words text-foreground">
+                        <span className="text-primary">&gt;</span> {ex.query}
+                      </p>
+                      {isFollowUp && (
+                        <p className="text-data-sm mt-1 text-muted-foreground">
+                          {modeLabelFor(ex.mode)}
+                        </p>
+                      )}
+                    </div>
                   </div>
-                </div>
 
-                {/* Response */}
-                <div className="flex gap-3">
-                  <img
-                    src="/thrace.png"
-                    alt="Thrace"
-                    className="mt-1 flex size-7 shrink-0 rounded-sm object-cover brightness-[0.65]"
-                    draggable={false}
-                  />
-                  <div className="min-w-0 flex-1 pt-0.5">
-                    {ex.status === "running" && ex.mode === "venture" && (
-                      <div className={ex.content ? "mb-3" : ""}>
-                        <PipelineSteps
-                          stages={ex.stages}
-                          detail={ex.statusDetail}
-                          reportStatus={ex.reportStatus}
-                        />
-                      </div>
-                    )}
-                    {ex.status === "running" && ex.mode !== "venture" && (
-                      <div className={ex.content ? "mb-3" : ""}>
-                        <StatusSteps label={ex.statusLabel} detail={ex.statusDetail} />
-                      </div>
-                    )}
-                    {ex.content ? (
-                      <div
-                        className={cn(
-                          "border-l-2 border-primary/40 bg-card/50 px-5 py-5",
-                          ex.status === "running" && "animate-pulse-slow",
-                        )}
-                      >
-                        <Markdown>{ex.content}</Markdown>
-                        {ex.status === "running" && (
-                          <div className="mt-4 flex items-center gap-2 font-mono text-xs text-muted-foreground">
-                            <LoaderCircle className="size-3.5 animate-spin text-primary" />
-                            streaming…
-                          </div>
+                  {/* Response — the report is the page, so it sits directly on
+                      the background with no avatar, rule or panel around it. */}
+                  <div className="min-w-0">
+                    {ex.status === "running" && (
+                      <div className={ex.content ? "mb-4" : ""}>
+                        {ex.mode === "venture" ? (
+                          <PipelineSteps
+                            stages={ex.stages}
+                            detail={ex.statusDetail}
+                            reportStatus={ex.reportStatus}
+                          />
+                        ) : (
+                          <StatusSteps label={ex.statusLabel} detail={ex.statusDetail} />
                         )}
                       </div>
-                    ) : null}
+                    )}
+
+                    {ex.content && <Markdown>{ex.content}</Markdown>}
+
+                    {ex.status === "running" && ex.content && (
+                      <p className="mt-4 flex items-center gap-2 font-mono text-xs text-muted-foreground">
+                        <LoaderCircle className="size-3.5 animate-spin text-primary" />
+                        streaming…
+                      </p>
+                    )}
+
                     {ex.status === "error" && (
-                      <div className="border-l-2 border-destructive bg-destructive/10 px-4 py-3 font-mono text-sm text-destructive">
-                        <p className="font-medium">analysis_failed</p>
-                        <p className="mt-1 text-destructive/80">{ex.error}</p>
+                      <div className="border border-destructive/40 bg-destructive/[0.07] px-4 py-3 font-mono text-sm text-destructive">
+                        <p className="font-medium">run_failed</p>
+                        <p className="mt-1 text-destructive/80 [overflow-wrap:anywhere]">
+                          {ex.error}
+                        </p>
                       </div>
                     )}
                   </div>
                 </div>
-              </div>
-            ))
+              )
+            })
           )}
         </div>
       </div>
@@ -237,7 +273,7 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
       {/* Input */}
       <div className="border-t border-border/70 bg-sidebar/60 px-3 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] sm:px-4 sm:py-3">
         <div className="mx-auto w-full max-w-3xl">
-          <div className="flex items-end gap-3 border border-border bg-card/70 px-3 py-2.5 focus-within:border-primary/50 focus-within:shadow-[0_0_0_1px] focus-within:shadow-primary/25">
+          <div className="flex items-end gap-2 border border-border bg-card/70 px-2.5 py-2.5 focus-within:border-primary/50 focus-within:shadow-[0_0_0_1px] focus-within:shadow-primary/25 sm:gap-3 sm:px-3">
             <span className="pb-0.5 font-mono text-sm text-primary">&gt;</span>
             <textarea
               ref={taRef}
@@ -251,7 +287,7 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
               }}
               placeholder={placeholder}
               rows={1}
-              className="scrollbar-hide max-h-36 flex-1 resize-none bg-transparent font-mono text-[13px] leading-6 text-foreground outline-none placeholder:text-muted-foreground/60"
+              className="scrollbar-hide max-h-36 min-w-0 flex-1 resize-none bg-transparent font-mono text-[13px] leading-6 text-foreground outline-none placeholder:text-muted-foreground/60"
               autoComplete="off"
               spellCheck={false}
             />
@@ -262,13 +298,13 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
               size="icon"
               onClick={submit}
               disabled={!draft.trim() || run?.status === "running"}
-              className="size-7 shrink-0 border border-primary/40 bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-30"
+              className="size-9 shrink-0 border border-primary/40 bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-30 sm:size-7"
             >
               <ChevronLeft className="size-4 rotate-180" />
             </Button>
           </div>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex gap-4 sm:gap-3">
+            <div className="flex flex-1 gap-2 sm:flex-none sm:gap-3">
               {MODES.map((m) => {
                 const disabled = m.id === "ask" && !hasReport
                 return (
@@ -283,7 +319,7 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
                     }
                     onClick={() => onModeChange(m.id)}
                     className={cn(
-                      "px-1 py-1 text-data-sm transition-colors",
+                      "min-h-9 flex-1 py-2 text-data-sm transition-colors sm:min-h-0 sm:flex-none sm:px-1 sm:py-1",
                       disabled
                         ? "cursor-not-allowed text-muted-foreground/30"
                         : mode === m.id

@@ -413,6 +413,9 @@ export function setServerChatPin(runId: string, pinned: boolean): Promise<void> 
 // ---------------------------------------------------------------------------
 // Discover scan persistence
 // ---------------------------------------------------------------------------
+/** A discovery scan proposes at most this many ideas (mirrors DISCOVERY_MAX_IDEAS). */
+export const DISCOVER_MAX_IDEAS = 4
+
 export interface DiscoverIdea {
   title: string
   prompt: string
@@ -468,6 +471,12 @@ export function streamAsk(
   question: string,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
+  subject?: string,
 ): Promise<void> {
-  return postStream("/api/ask", { content, question }, onEvent, signal)
+  return postStream(
+    "/api/ask",
+    { content, question, subject: subject ?? "" },
+    onEvent,
+    signal,
+  )
 }

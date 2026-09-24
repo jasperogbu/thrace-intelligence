@@ -5,7 +5,7 @@ import sys
 import urllib.request
 
 IDEA = sys.argv[1] if len(sys.argv) > 1 else "Start a food processing business in Jos, Nigeria"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/jaspa_venture_run.sse"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/thrace_venture_run.sse"
 
 req = urllib.request.Request(
     "http://localhost:8000/api/venture",

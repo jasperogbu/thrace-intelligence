@@ -20,7 +20,9 @@ import { resetDiscoverHydration } from "@/lib/discover-store"
 import type { RunMode } from "@/lib/api"
 import { toast } from "sonner"
 
-const SIDEBAR_KEY = "jaspa_sidebar"
+const SIDEBAR_KEY = "thrace_sidebar"
+/** Pre-rename key — read once as a fallback so the preference survives. */
+const LEGACY_SIDEBAR_KEY = "jaspa_sidebar"
 
 function AppShell() {
   const { user, ready, setUser, logout } = useAuth()
@@ -41,7 +43,9 @@ function AppShell() {
   const [view, setView] = useState<View>(() => (activeRun ? "workspace" : "landing"))
   const [sidebarExpanded, setSidebarExpanded] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(SIDEBAR_KEY) !== "collapsed"
+      const stored =
+        localStorage.getItem(SIDEBAR_KEY) ?? localStorage.getItem(LEGACY_SIDEBAR_KEY)
+      return stored !== "collapsed"
     } catch {
       return true
     }
@@ -74,6 +78,9 @@ function AppShell() {
 
   const runAnalysis = useCallback(
     (query: string, runMode: RunMode, appendToId?: string) => {
+      // A new chat adopts the nature it was started with; an existing chat
+      // keeps its own (openRun/selectHistory set it when it was opened).
+      if (!appendToId) setMode(runMode === "venture" ? "venture" : "competitor")
       startRun(query, runMode, appendToId)
       setView("workspace")
     },
@@ -170,6 +177,7 @@ function AppShell() {
   const renderSidebar = (mobile: boolean) => (
     <Sidebar
       expanded={mobile ? true : sidebarExpanded}
+      isDrawer={mobile}
       onToggle={mobile ? () => setDrawerOpen(false) : toggleSidebar}
       view={view}
       activeId={activeId}
@@ -230,34 +238,35 @@ function AppShell() {
           </div>
 
           <div className="flex min-w-0 flex-1 flex-col">
-            {/* Mobile top bar */}
-            <div className="flex items-center gap-2 border-b border-border/70 bg-sidebar/60 px-2 py-2 md:hidden">
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setDrawerOpen(true)}
-                aria-label="Open navigation"
-                className="size-9"
-              >
-                <Menu className="size-5" />
-              </Button>
-              <img
-                src="/thrace.png"
-                alt="Thrace"
-                className="size-6 rounded-sm object-cover brightness-[0.65]"
-                draggable={false}
-              />
-              <span className="font-display text-base font-medium tracking-tight text-foreground">
-                Thrace
-              </span>
-              <span className="ml-auto font-mono text-[11px] uppercase tracking-widest text-primary">
-                {view === "landing"
-                  ? "home"
-                  : view === "workspace"
-                    ? "chat"
-                    : view}
-              </span>
-            </div>
+            {/* Mobile top bar — the chat screen renders its own header, so this
+                would otherwise stack a second bar above it. */}
+            {view !== "workspace" && (
+              <div className="flex items-center gap-2 border-b border-border/70 bg-sidebar/60 px-2 py-2 md:hidden">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setDrawerOpen(true)}
+                  aria-label="Open navigation"
+                  className="size-9"
+                >
+                  <Menu className="size-5" />
+                </Button>
+                <img
+                  src="/thrace.png"
+                  alt="Thrace"
+                  className="size-6 rounded-sm object-cover brightness-[0.65]"
+                  draggable={false}
+                />
+                <span className="font-display text-base font-medium tracking-tight text-foreground">
+                  Thrace
+                </span>
+                {view !== "landing" && (
+                  <span className="ml-auto font-mono text-[11px] uppercase tracking-widest text-primary">
+                    {view}
+                  </span>
+                )}
+              </div>
+            )}
 
             {view === "landing" && <Landing onAnalyze={runAnalysis} />}
             {view === "library" && (
@@ -282,6 +291,7 @@ function AppShell() {
                 onRun={runAnalysis}
                 onToggleWatch={toggleWatch}
                 onNew={newChat}
+                onMenu={() => setDrawerOpen(true)}
               />
             )}
           </div>

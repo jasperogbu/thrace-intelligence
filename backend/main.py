@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -113,6 +113,50 @@ def health() -> HealthResponse:
     )
 
 
+# Idle SSE streams are dropped by some proxies and browsers; a comment line
+# every few seconds keeps the connection warm during long research phases.
+_SSE_HEARTBEAT_SECONDS = 10
+
+
+def _sse_stream(worker: Callable[[queue.Queue], None]) -> StreamingResponse:
+    """Serve `worker` over SSE, keeping the stream alive while it works.
+
+    `worker` runs on its own thread and publishes event dicts onto the queue it
+    is handed. While the queue is idle the response emits SSE comment lines
+    (ignored by the client) so a quiet research phase never looks like a dead
+    connection.
+    """
+
+    def generate():
+        q: queue.Queue = queue.Queue()
+        thread = threading.Thread(target=worker, args=(q,), daemon=True)
+        thread.start()
+        last_beat = time.monotonic()
+        try:
+            while thread.is_alive() or not q.empty():
+                try:
+                    item = q.get(timeout=0.5)
+                except queue.Empty:
+                    if time.monotonic() - last_beat >= _SSE_HEARTBEAT_SECONDS:
+                        last_beat = time.monotonic()
+                        yield ": keep-alive\n\n"
+                    continue
+                last_beat = time.monotonic()
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            thread.join(timeout=2)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
     company = req.company.strip()
@@ -133,49 +177,49 @@ def analyze(req: AnalyzeRequest):
             detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
         )
 
-    def generate():
-        q: queue.Queue = queue.Queue()
-
+    def worker(q: queue.Queue):
         def emit(event_type: str, **fields):
             q.put({"type": event_type, **fields})
 
-        def worker():
-            try:
-                emit("status", label="Searching the web", detail=f"Scanning live sources for {company}...")
-                bullets = agents.run_bullets(analysis_type, company)
-
-                emit("status", label="Synthesising insights", detail="Agents are reasoning over the gathered evidence...")
-                emit("stage_start", stage="report", label="Report")
-
-                for event in agents.stream_report(analysis_type, company, bullets):
-                    q.put(event)
-
-                emit("done")
-            except Exception as exc:  # noqa: BLE001
-                emit("error", message=str(exc))
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
         try:
-            while thread.is_alive() or not q.empty():
-                try:
-                    item = q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-        finally:
-            thread.join(timeout=2)
+            # Instant preliminary read so the user sees text within ~1-2s.
+            emit(
+                "status",
+                label="Preliminary read",
+                detail=f"Drafting an immediate first impression of {company}…",
+            )
+            for event in agents.xray_provisional(analysis_type, company):
+                q.put(event)
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+            emit("status", label="Searching the web", detail=f"Scanning live sources for {company}...")
+            bullets = agents.run_bullets(analysis_type, company)
+
+            emit("status", label="Synthesising insights", detail="Agents are reasoning over the gathered evidence...")
+            emit("stage_start", stage="report", label="Report")
+
+            # The preliminary read is the only text on screen at this point, so
+            # it is discarded only once the researched report actually produces
+            # content. Clearing it up front left a blank report whenever the
+            # researched pass returned nothing.
+            researched = False
+            for event in agents.stream_report(analysis_type, company, bullets):
+                if not researched and event.get("type") == "delta" and event.get("data"):
+                    researched = True
+                    emit("reset")
+                q.put(event)
+
+            if not researched:
+                emit(
+                    "status",
+                    label="Research incomplete",
+                    detail="Live research returned no findings — showing the preliminary read.",
+                )
+
+            emit("done")
+        except Exception as exc:  # noqa: BLE001
+            emit("error", message=str(exc))
+
+    return _sse_stream(worker)
 
 
 @app.post("/api/venture")
@@ -195,39 +239,15 @@ def venture(req: VentureRequest):
             detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
         )
 
-    def generate():
-        q: queue.Queue = queue.Queue()
-
-        def worker():
-            try:
-                for event in agents.run_venture_pipeline(idea):
-                    q.put(event)
-                q.put({"type": "done"})
-            except Exception as exc:  # noqa: BLE001
-                q.put({"type": "error", "message": str(exc)})
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
+    def worker(q: queue.Queue):
         try:
-            while thread.is_alive() or not q.empty():
-                try:
-                    item = q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-        finally:
-            thread.join(timeout=2)
+            for event in agents.run_venture_pipeline(idea):
+                q.put(event)
+            q.put({"type": "done"})
+        except Exception as exc:  # noqa: BLE001
+            q.put({"type": "error", "message": str(exc)})
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return _sse_stream(worker)
 
 
 # ---------------------------------------------------------------------------
@@ -489,33 +509,14 @@ def discover(req: DiscoverRequest):
     if not status["ready"]:
         raise HTTPException(status_code=503, detail="Thrace is not ready.")
 
-    def generate():
-        q: queue.Queue = queue.Queue()
-
-        def worker():
-            try:
-                for event in agents.run_discovery(focus):
-                    q.put(event)
-            except Exception as exc:  # noqa: BLE001
-                q.put({"type": "error", "message": str(exc)})
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+    def worker(q: queue.Queue):
         try:
-            while thread.is_alive() or not q.empty():
-                try:
-                    item = q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-        finally:
-            thread.join(timeout=2)
+            for event in agents.run_discovery(focus):
+                q.put(event)
+        except Exception as exc:  # noqa: BLE001
+            q.put({"type": "error", "message": str(exc)})
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-    )
+    return _sse_stream(worker)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +525,7 @@ def discover(req: DiscoverRequest):
 class AskRequest(BaseModel):
     content: str
     question: str
+    subject: str = ""
 
 
 @app.post("/api/ask")
@@ -537,33 +539,14 @@ def ask(req: AskRequest):
     if not status["ready"]:
         raise HTTPException(status_code=503, detail="Thrace is not ready.")
 
-    def generate():
-        q: queue.Queue = queue.Queue()
-
-        def worker():
-            try:
-                for event in agents.answer_question(req.content, question):
-                    q.put(event)
-            except Exception as exc:  # noqa: BLE001
-                q.put({"type": "error", "message": str(exc)})
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+    def worker(q: queue.Queue):
         try:
-            while thread.is_alive() or not q.empty():
-                try:
-                    item = q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-        finally:
-            thread.join(timeout=2)
+            for event in agents.answer_question(req.content, question, req.subject):
+                q.put(event)
+        except Exception as exc:  # noqa: BLE001
+            q.put({"type": "error", "message": str(exc)})
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-    )
+    return _sse_stream(worker)
 
 
 # ---------------------------------------------------------------------------

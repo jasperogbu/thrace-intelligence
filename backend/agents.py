@@ -11,11 +11,13 @@ Two coordinated intelligence pipelines:
    competitor / sentiment / metrics reports for an existing company.
 """
 import os
+import queue
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from textwrap import dedent
-from typing import Iterator
+from typing import Callable, Iterator
 
 from agno.agent import Agent
 from agno.team import Team
@@ -162,6 +164,12 @@ TOOLS = _make_tools
 # Default model; override with LLM_MODEL in .env (e.g. a router/gateway model id).
 MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 
+# Per-call retry budget for transient provider errors. Deliberately minimal:
+# the model layer rotates to a healthy model on its own, so sleeping inside a
+# single call mostly just delays that rotation.
+_LLM_RETRIES = int(os.getenv("LLM_RETRIES", "1"))
+_LLM_RETRY_DELAY = int(os.getenv("LLM_RETRY_DELAY", "1"))
+
 # Gemini free tier enforces per-model request quotas (surfaced as 429
 # RESOURCE_EXHAUSTED with a short retry window, in practice ~1 minute). A
 # pipeline run needs dozens of requests, so instead of hammering one model
@@ -174,6 +182,15 @@ _GEMINI_DEFAULT_FALLBACKS = (
 )
 _QUOTA_COOLDOWN_DEFAULT = float(os.getenv("QUOTA_COOLDOWN_SECONDS", "60"))
 _GEMINI_MIN_INTERVAL = float(os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "1.2"))
+# A benched model is skipped for at most this long, and the request pipeline
+# never pauses longer than this waiting for a free model. Both are speed
+# guards: honouring a provider's full 60s retry window while three other
+# models sit idle is the single biggest source of multi-minute runs.
+_QUOTA_BENCH_CAP = float(os.getenv("QUOTA_BENCH_CAP_SECONDS", "15"))
+_MAX_COOLDOWN_WAIT = float(os.getenv("QUOTA_MAX_WAIT_SECONDS", "2"))
+# How long to bench a model after a capacity spike (503). Short: the spike is
+# usually momentary and another model in the pool can serve the request now.
+_TRANSIENT_BENCH_SECONDS = float(os.getenv("TRANSIENT_BENCH_SECONDS", "3"))
 
 _rotation_lock = threading.Lock()
 _pacer_lock = threading.Lock()
@@ -203,30 +220,44 @@ def _model_pool() -> list[str]:
 def _next_model() -> str:
     """Round-robin the next usable model.
 
-    Skips models cooling down from quota errors; if every model is cooling
-    down, blocks until the earliest one frees up (its retry window expires).
+    Skips models benched by a quota error. When every model is cooling down we
+    pause briefly and then return the model that frees up soonest, rather than
+    blocking until its full retry window expires — a run must never stall for a
+    minute because one model is throttled.
     """
     global _rr_index
-    while True:
-        with _rotation_lock:
-            pool = _model_pool()
-            now = time.monotonic()
-            usable = [m for m in pool if _quota_marks.get(m, 0.0) <= now]
-            if usable:
-                _rr_index += 1
-                return usable[_rr_index % len(usable)]
-            wait = max(0.5, min(_quota_marks[m] for m in pool) - now)
-        print(
-            f"[jaspa] all Gemini models cooling down; waiting {wait:.0f}s",
-            flush=True,
-        )
-        time.sleep(wait)
+    with _rotation_lock:
+        pool = _model_pool()
+        if len(pool) == 1:
+            return pool[0]
+        now = time.monotonic()
+        usable = [m for m in pool if _quota_marks.get(m, 0.0) <= now]
+        if usable:
+            _rr_index += 1
+            return usable[_rr_index % len(usable)]
+        soonest = min(pool, key=lambda m: _quota_marks.get(m, 0.0))
+        wait = _quota_marks[soonest] - now
+    capped = min(max(wait, 0.0), _MAX_COOLDOWN_WAIT)
+    print(
+        f"[thrace] all Gemini models cooling down; earliest free in {wait:.0f}s "
+        f"(pausing {capped:.1f}s, then trying anyway)",
+        flush=True,
+    )
+    if capped > 0:
+        time.sleep(capped)
+    return soonest
 
 
 def _mark_model_exhausted(model: str, seconds: float) -> None:
-    """Skip `model` for the provider-reported retry window (min 30s)."""
+    """Bench `model` so the next request rotates to another model.
+
+    The provider-reported window is honoured but capped (see
+    `_QUOTA_BENCH_CAP`): with several models in the pool, a short bench plus
+    immediate failover beats waiting out a long window.
+    """
     with _rotation_lock:
-        until = time.monotonic() + max(seconds, 30.0) + 3.0
+        window = min(max(seconds, 2.0), _QUOTA_BENCH_CAP)
+        until = time.monotonic() + window + 1.0
         _quota_marks[model] = max(_quota_marks.get(model, 0.0), until)
 
 
@@ -262,32 +293,26 @@ def _pace_gemini_request() -> None:
 class _PacedGemini(Gemini):
     """Gemini client that round-robins every request across the model pool.
 
-    Each request picks the next usable model and is globally paced. Quota
-    errors rotate to another model and transparently retry, so free-tier
-    per-model limits never surface to the agent layer.
+    Each request picks the next usable model and is globally paced. Any
+    transient provider error rotates to another model and transparently
+    retries, so per-model limits and capacity spikes never surface to the
+    agent layer.
     """
 
     def invoke(self, *args, **kwargs):
-        max_attempts = len(_model_pool()) + 2
+        max_attempts = max(len(_model_pool()) * 2, 4)
         for attempt in range(1, max_attempts + 1):
             self.id = _next_model()
             _pace_gemini_request()
             try:
                 return super().invoke(*args, **kwargs)
             except Exception as exc:  # noqa: BLE001
-                if _is_quota_error(exc) and attempt < max_attempts:
-                    delay = _parse_retry_delay(exc)
-                    _mark_model_exhausted(self.id, delay)
-                    print(
-                        f"[jaspa] {self.id} hit its quota (window {delay:.0f}s); "
-                        "rotating to the next model",
-                        flush=True,
-                    )
+                if _rotate_on(self.id, exc, attempt, max_attempts):
                     continue
                 raise
 
     def invoke_stream(self, *args, **kwargs):
-        max_attempts = len(_model_pool()) + 2
+        max_attempts = max(len(_model_pool()) * 2, 4)
         for attempt in range(1, max_attempts + 1):
             self.id = _next_model()
             _pace_gemini_request()
@@ -301,18 +326,7 @@ class _PacedGemini(Gemini):
                 # A stream that already produced output cannot restart here
                 # without duplicating content; the pipeline layer handles
                 # that case (it can reset the client's accumulated text).
-                if (
-                    _is_quota_error(exc)
-                    and not emitted
-                    and attempt < max_attempts
-                ):
-                    delay = _parse_retry_delay(exc)
-                    _mark_model_exhausted(self.id, delay)
-                    print(
-                        f"[jaspa] {self.id} hit its quota (window {delay:.0f}s); "
-                        "rotating to the next model",
-                        flush=True,
-                    )
+                if not emitted and _rotate_on(self.id, exc, attempt, max_attempts):
                     continue
                 raise
 
@@ -334,22 +348,25 @@ def _chat_model():
         return _PacedGemini(
             id=MODEL,
             api_key=os.getenv("GEMINI_API_KEY") or api_key,
-            # Transient provider rate limits are retryable; Agno's `retries`
-            # defaults to 0, which disables backoff.
-            retries=5,
+            # Transient provider rate limits are retryable, but Agno's retries
+            # multiply: with exponential backoff, retries=5/delay=8 sleeps
+            # 8+16+32+64+128s on one flaky call. Quota errors are already
+            # absorbed by the round-robin above, so keep in-call retries short
+            # and let the outer stage wrapper own the real backoff.
+            retries=_LLM_RETRIES,
             exponential_backoff=True,
-            delay_between_retries=8,
+            delay_between_retries=_LLM_RETRY_DELAY,
         )
     base_url = os.getenv("LLM_BASE_URL") or None
     return OpenAIChat(
         id=MODEL,
         api_key=api_key,
         base_url=base_url,
-        # Transient provider 429s (e.g. Groq free-tier TPM windows) are
-        # retryable; Agno's `retries` defaults to 0, which disables backoff.
-        retries=5,
+        # Transient provider 429s (e.g. free-tier TPM windows) are retryable;
+        # Agno's `retries` defaults to 0, which disables backoff entirely.
+        retries=_LLM_RETRIES,
         exponential_backoff=True,
-        delay_between_retries=8,
+        delay_between_retries=_LLM_RETRY_DELAY,
     )
 
 # ---------------------------------------------------------------------------
@@ -527,8 +544,11 @@ def _check_run(resp, context: str) -> str:
 # capacity spikes ("model experiencing high demand"), which are common on
 # new Gemini models on the free tier. This outer wrapper retries whole
 # stage runs when the failure text looks transient.
-_STAGE_MAX_ATTEMPTS = int(os.getenv("STAGE_MAX_ATTEMPTS", "4"))
-_STAGE_RETRY_DELAY = int(os.getenv("STAGE_RETRY_DELAY", "15"))
+# Stage-level retry budget. `_STAGE_RETRY_DELAY * attempt` used to be 15/30/45s
+# of dead time per stage; stages now also run concurrently, so a long sleep on
+# one stage blocks the whole report. Keep it short.
+_STAGE_MAX_ATTEMPTS = int(os.getenv("STAGE_MAX_ATTEMPTS", "3"))
+_STAGE_RETRY_DELAY = int(os.getenv("STAGE_RETRY_DELAY", "4"))
 
 _TRANSIENT_MARKERS = (
     "429",
@@ -550,12 +570,36 @@ def _is_transient_error(exc: Exception) -> bool:
     return any(marker in msg for marker in _TRANSIENT_MARKERS)
 
 
+def _rotate_on(model: str, exc: Exception, attempt: int, max_attempts: int) -> bool:
+    """Bench `model` and rotate to the next one.
+
+    Called from the model layer for any transient provider error. Retrying the
+    same model on a 503 ("model experiencing high demand") burns the run's time
+    budget while other pooled models sit idle, so both quota (429) and capacity
+    errors rotate. Returns False when we are out of attempts or the failure is
+    not transient, i.e. the caller should re-raise.
+    """
+    if attempt >= max_attempts or not _is_transient_error(exc):
+        return False
+    _mark_model_exhausted(model, _bench_seconds(exc))
+    print(
+        f"[thrace] {model} unavailable/rate-limited; rotating to the next model",
+        flush=True,
+    )
+    return True
+
+
+def _bench_seconds(exc: Exception) -> float:
+    """How long to bench the failed model: the quota window, or a short pause."""
+    return _parse_retry_delay(exc) if _is_quota_error(exc) else _TRANSIENT_BENCH_SECONDS
+
+
 def _run_with_retries(run_fn, context: str):
     """Run a callable, retrying on transient provider errors with backoff.
 
-    Quota (429) errors are already absorbed at the model layer (round-robin
-    + transparent retry); this outer wrapper is the backstop for other
-    transient failures (503 capacity spikes, network blips).
+    Quota (429) and capacity (503) errors are already absorbed at the model
+    layer (round-robin + transparent rotation); this outer wrapper is the
+    backstop for failures that outlive every model in the pool.
     """
     for attempt in range(1, _STAGE_MAX_ATTEMPTS + 1):
         try:
@@ -565,7 +609,7 @@ def _run_with_retries(run_fn, context: str):
                 raise
             wait = _STAGE_RETRY_DELAY * attempt
             print(
-                f"[jaspa] transient provider error in {context} "
+                f"[thrace] transient provider error in {context} "
                 f"(attempt {attempt}/{_STAGE_MAX_ATTEMPTS}); retrying in {wait}s — "
                 f"{str(exc)[:200]}",
                 flush=True,
@@ -658,11 +702,53 @@ def expand_prompt(analysis_type: str, company: str, bullets: str) -> str:
     """)
 
 
+_xray_agents: dict[str, Agent] | None = None
+_xray_report_agent: Agent | None = None
+
+
+def build_xray_agents() -> dict[str, Agent]:
+    """Build (or return cached) the X-Ray agents, keyed by analysis type.
+
+    The X-Ray modes call the relevant specialist directly instead of routing
+    through the `Team` supervisor: a single-request team run costs an extra
+    round of leader model calls without adding analysis. `build_team()` is
+    still built for the agent roster on /api/health.
+    """
+    global _xray_agents
+    if _xray_agents is None:
+        _xray_agents = {
+            "competitor": _competitor_agent(),
+            "sentiment": _sentiment_agent(),
+            "metrics": _metrics_agent(),
+        }
+    return _xray_agents
+
+
+def _build_xray_report_agent() -> Agent:
+    """Formats gathered bullets into the final X-Ray report (no tools — fast)."""
+    global _xray_report_agent
+    if _xray_report_agent is None:
+        _xray_report_agent = Agent(
+            name="Thrace X-Ray Analyst",
+            description=dedent("""
+                You turn gathered evidence bullets into a polished, structured
+                intelligence report. You add nothing that is not supported by
+                the bullets you are given — you structure, tighten and format.
+            """),
+            model=_chat_model(),
+            markdown=True,
+        )
+    return _xray_report_agent
+
+
 def run_bullets(analysis_type: str, company: str) -> str:
     """Non-streaming first pass producing evidence-based insight bullets."""
     prompt = bullets_prompt(analysis_type, company)
     return _run_with_retries(
-        lambda: _check_run(build_team().run(prompt), "Evidence gathering failed"),
+        lambda: _check_run(
+            build_xray_agents()[analysis_type].run(prompt),
+            "Evidence gathering failed",
+        ),
         "Evidence gathering",
     )
 
@@ -681,7 +767,7 @@ def stream_report(analysis_type: str, company: str, bullets: str) -> Iterator[di
     while True:
         attempt += 1
         failure: Exception | None = None
-        for event in build_team().run(prompt, stream=True):
+        for event in _build_xray_report_agent().run(prompt, stream=True):
             if isinstance(event, RunContentEvent):
                 delta = event.content
                 if delta:
@@ -701,11 +787,11 @@ def stream_report(analysis_type: str, company: str, bullets: str) -> Iterator[di
             if emitted:
                 yield {"type": "reset"}
                 emitted = False
-            global _team
-            _team = None
+            global _xray_report_agent
+            _xray_report_agent = None
             wait = _STAGE_RETRY_DELAY * attempt
             print(
-                f"[jaspa] transient provider error in report generation "
+                f"[thrace] transient provider error in report generation "
                 f"(attempt {attempt}/{_STAGE_MAX_ATTEMPTS}); restarting in {wait}s — "
                 f"{str(failure)[:200]}",
                 flush=True,
@@ -713,6 +799,39 @@ def stream_report(analysis_type: str, company: str, bullets: str) -> Iterator[di
             time.sleep(wait)
             continue
         raise failure
+
+
+_XRAY_FOCUS = {
+    "competitor": "its market positioning, recent launches, strengths and weaknesses",
+    "sentiment": "how the market perceives it — the positive and negative drivers",
+    "metrics": "its publicly visible performance metrics and growth signals",
+}
+
+
+def xray_provisional(analysis_type: str, company: str) -> Iterator[dict]:
+    """Instant preliminary read for a Company X-Ray run.
+
+    Streams delta events before research starts; the caller clears them with a
+    `reset` once the researched report begins (see `_stream_provisional`).
+    """
+    focus = _XRAY_FOCUS.get(analysis_type, "its market position")
+    return _stream_provisional(
+        "Thrace Quick Read",
+        dedent("""
+            You give an immediate, honest first impression of a company before
+            any research has been done. You are concise and never invent
+            figures, metrics or sources.
+        """),
+        dedent(f"""
+            Give your immediate preliminary read on {company}, focused on {focus}.
+
+            Under 100 words: one bold line, then the single most notable strength
+            and the single most notable concern.
+
+            Markdown, no headings, no sources — a first impression only.
+        """),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Venture Intelligence pipeline (primary feature)
@@ -921,6 +1040,9 @@ def _monitor_agent() -> Agent:
     )
 
 
+DISCOVERY_MAX_IDEAS = int(os.getenv("DISCOVERY_MAX_IDEAS", "4"))
+
+
 def _discovery_agent() -> Agent:
     return Agent(
         name="Opportunity Discovery Agent",
@@ -930,7 +1052,10 @@ def _discovery_agent() -> Agent:
             validating — you find opportunities, you do not validate them.
             For a given location or sector focus, search for: emerging demand,
             supply gaps, policy changes, infrastructure shifts and rising consumer
-            trends. Then propose 4-6 concrete, specific ideas.
+            trends. Then propose exactly four concrete, specific ideas — never
+            more than four.
+            Keep the scan tight: run at most four searches, then write up the
+            ideas you have evidence for.
             Output STRICTLY in this format, one block per idea:
             ### {Short title}
             idea: {one-line business idea, specific enough to validate, including location}
@@ -1006,6 +1131,8 @@ _BRIEF_RULES = dedent("""
     - Every factual claim must trace to something you found or were given.
     - End with a 'Sources:' section listing all URLs searched or crawled.
     - Keep the brief under 450 words.
+    - Research efficiently: at most 2 web searches, and do not crawl pages.
+      Each extra search costs a model request against a tight quota.
 """)
 
 
@@ -1158,82 +1285,249 @@ def venture_report_prompt(idea: str, findings: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 # Venture pipeline runner
 # ---------------------------------------------------------------------------
-def run_venture_pipeline(idea: str) -> Iterator[dict]:
-    """Run the 5-stage venture pipeline, yielding SSE-ready event dicts.
+# Wall-clock ceiling for the research phase of a run. Sized so both waves
+# (validation, then the other four in parallel) finish with room to spare; a
+# stage still outstanding when it expires is abandoned and the report names the
+# gap, so a run can never sprawl into the multi-minute failures we shipped
+# before. Override with VENTURE_BUDGET_SECONDS.
+_VENTURE_BUDGET_SECONDS = float(os.getenv("VENTURE_BUDGET_SECONDS", "180"))
+_XRAY_BUDGET_SECONDS = float(os.getenv("XRAY_BUDGET_SECONDS", "120"))
+# Revisions are full extra research passes — by far the most expensive thing a
+# run does. Capped per run so one demanding stage cannot consume the whole
+# daily request quota (the free tier allows only 20 requests/model/day).
+_MAX_REVISIONS_PER_RUN = int(os.getenv("MAX_REVISIONS_PER_RUN", "2"))
+# Skip a revision when this little budget is left: it cannot finish in time.
+_REVISION_MIN_SECONDS = float(os.getenv("REVISION_MIN_SECONDS", "25"))
 
-    Events: stage_start / stage_done per stage, then stage_start("report")
-    followed by delta events as the final report streams.
+
+class _RevisionBudget:
+    """Thread-safe cap on how many stages a single run may send back."""
+
+    def __init__(self, limit: int) -> None:
+        self._remaining = limit
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        with self._lock:
+            if self._remaining <= 0:
+                return False
+            self._remaining -= 1
+            return True
+
+
+def _stream_provisional(name: str, description: str, prompt: str) -> Iterator[dict]:
+    """Stream an immediate preliminary read, before any research runs.
+
+    This is what makes the app feel like a chat product: first tokens reach the
+    client in ~1-2s instead of after the entire pipeline. The text is explicitly
+    provisional and is discarded (via a `reset` event) the moment the
+    evidence-backed report starts streaming.
     """
-    findings: dict[str, str] = {}
+    try:
+        agent = Agent(
+            name=name,
+            description=description,
+            model=_chat_model(),
+            markdown=True,
+        )
+        for event in agent.run(prompt, stream=True):
+            if isinstance(event, AgentRunContentEvent):
+                if event.content:
+                    yield {"type": "delta", "data": event.content}
+            elif isinstance(event, AgentRunErrorEvent):
+                return
+    except Exception as exc:  # noqa: BLE001
+        # A failed preliminary read must never fail the run.
+        print(f"[thrace] provisional draft unavailable: {str(exc)[:160]}", flush=True)
 
-    for stage in VENTURE_STAGES:
+
+def _research_stage(
+    stage: dict,
+    idea: str,
+    prior: dict[str, str],
+    emit: Callable[[dict], None],
+    revision_budget: _RevisionBudget,
+    deadline: float,
+) -> str:
+    """Run one stage to completion: brief, self-critique, and any revision.
+
+    Executed on a worker thread, so the critique (and revision) overlap the
+    other stages instead of serialising behind them.
+    """
+    stage_id, label = stage["id"], stage["label"]
+    started = time.monotonic()
+    brief = _run_with_retries(
+        lambda: _check_run(
+            build_venture_agents()[stage_id].run(
+                venture_stage_prompt(stage_id, idea, prior)
+            ),
+            f"{label} stage failed",
+        ),
+        f"{label} stage",
+    )
+    print(
+        f"[thrace] {label}: brief in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
+
+    # Self-critique loop: a reviewer judges the brief's evidence; a REVISE
+    # verdict sends the stage agent back for the specific gaps (adaptive
+    # research budget — extra searches only where evidence is thin).
+    try:
+        critique = _run_with_retries(
+            lambda: _check_run(
+                _critic_agent().run(
+                    f"Stage: {label}\nSubject: {idea}\n\n=== BRIEF ===\n{brief}"
+                ),
+                f"{label} critique failed",
+            ),
+            f"{label} critique",
+        ).strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[thrace] critique skipped for {label}: {str(exc)[:160]}", flush=True)
+        return brief
+
+    if not critique.upper().startswith("REVISE"):
+        print(
+            f"[thrace] {label}: done in {time.monotonic() - started:.1f}s", flush=True
+        )
+        return brief
+
+    # A revision is a full extra research pass. Only spend on it when the run
+    # can still afford the time, and when this run's revision budget allows.
+    if (
+        time.monotonic() > deadline - _REVISION_MIN_SECONDS
+        or not revision_budget.take()
+    ):
+        print(
+            f"[thrace] {label}: revision skipped (budget/quota) — keeping first brief",
+            flush=True,
+        )
+        return brief
+
+    emit(
+        {
+            "type": "status",
+            "label": "Deepening research",
+            "detail": f"Reviewer found evidence gaps in {label} — re-researching",
+        }
+    )
+    revision_prompt = dedent(f"""
+        Your earlier brief for "{idea}" was reviewed and judged insufficient:
+
+        REVIEWER VERDICT: {critique}
+
+        Original brief:
+        {brief}
+
+        Produce a REVISED brief addressing the reviewer's specific gaps.
+        Run additional targeted web searches to fill the missing evidence
+        (you may search multiple times with different queries). Keep the
+        same output structure as the original brief and stay under 450 words.
+        Cite source URLs inline and end with a 'Sources:' section.
+    """)
+    try:
+        revised = _run_with_retries(
+            lambda: _check_run(
+                build_venture_agents()[stage_id].run(revision_prompt),
+                f"{label} revision failed",
+            ),
+            f"{label} revision",
+        )
+        print(
+            f"[thrace] {label}: revised in {time.monotonic() - started:.1f}s",
+            flush=True,
+        )
+        return revised
+    except Exception as exc:  # noqa: BLE001
+        # Keep the original brief rather than losing the stage entirely.
+        print(f"[thrace] revision skipped for {label}: {str(exc)[:160]}", flush=True)
+        return brief
+
+
+def _run_wave(
+    stages: list[dict],
+    idea: str,
+    findings: dict[str, str],
+    deadline: float,
+    revision_budget: _RevisionBudget,
+) -> Iterator[dict]:
+    """Run a set of stages concurrently, yielding progress then results.
+
+    Every stage is announced up front (they really are running in parallel),
+    then stage_done is emitted as each finishes. Work still outstanding at
+    `deadline` is abandoned and reported instead of hanging the run.
+    """
+    for stage in stages:
         yield {
             "type": "stage_start",
             "stage": stage["id"],
             "label": stage["label"],
             "detail": stage["detail"],
         }
-        stage_id, stage_label = stage["id"], stage["label"]
-        stage_prompt = venture_stage_prompt(stage_id, idea, findings)
-        brief = _run_with_retries(
-            lambda: _check_run(
-                build_venture_agents()[stage_id].run(stage_prompt),
-                f"{stage_label} stage failed",
-            ),
-            f"{stage_label} stage",
-        )
 
-        # Self-critique loop: a reviewer judges the brief's evidence; when
-        # gaps are found the stage agent researches them specifically and
-        # produces a revised brief (adaptive research budget — extra searches
-        # happen only where evidence is thin).
-        critique = _run_with_retries(
-            lambda: _check_run(
-                _critic_agent().run(
-                    f"Stage: {stage_label}\nSubject: {idea}\n\n=== BRIEF ===\n{brief}"
-                ),
-                f"{stage_label} critique failed",
-            ),
-            f"{stage_label} critique",
-        ).strip()
-        if critique.upper().startswith("REVISE"):
-            yield {
-                "type": "status",
-                "label": "Deepening research",
-                "detail": f"Reviewer found evidence gaps in {stage_label} — re-researching",
-            }
-            revision_prompt = dedent(f"""
-                Your earlier brief for "{idea}" was reviewed and judged insufficient:
+    events: queue.Queue = queue.Queue()
+    # Snapshot the prior findings: stages in the same wave must not read each
+    # other's output, or their results would depend on completion order.
+    prior = dict(findings)
+    pool = ThreadPoolExecutor(max_workers=len(stages))
+    try:
+        futures = {
+            pool.submit(
+                _research_stage, stage, idea, prior, events.put, revision_budget, deadline
+            ): stage
+            for stage in stages
+        }
+        finished: set[str] = set()
+        remaining = deadline - time.monotonic()
+        try:
+            for future in as_completed(futures, timeout=max(remaining, 1.0)):
+                stage = futures[future]
+                finished.add(stage["id"])
+                try:
+                    findings[stage["id"]] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[thrace] {stage['label']} stage failed: {str(exc)[:200]}",
+                        flush=True,
+                    )
+                    yield {
+                        "type": "status",
+                        "label": "Stage failed",
+                        "detail": f"{stage['label']}: {str(exc)[:160]}",
+                    }
+                yield {"type": "stage_done", "stage": stage["id"]}
+        except TimeoutError:
+            pass
 
-                REVIEWER VERDICT: {critique}
+        # Drain progress events (e.g. "deepening research") emitted while waiting.
+        while True:
+            try:
+                yield events.get_nowait()
+            except queue.Empty:
+                break
 
-                Original brief:
-                {brief}
+        for stage in stages:
+            if stage["id"] not in finished:
+                print(
+                    f"[thrace] budget exhausted before {stage['label']} finished",
+                    flush=True,
+                )
+                yield {
+                    "type": "status",
+                    "label": "Research budget reached",
+                    "detail": (
+                        f"{stage['label']} did not finish in time — "
+                        "the report notes the gap"
+                    ),
+                }
+    finally:
+        # Never block on stragglers; abandoned work finishes off the hot path.
+        pool.shutdown(wait=False, cancel_futures=True)
 
-                Produce a REVISED brief addressing the reviewer's specific gaps.
-                Run additional targeted web searches to fill the missing evidence
-                (you may search multiple times with different queries). Keep the
-                same output structure as the original brief and stay under 450 words.
-                Cite source URLs inline and end with a 'Sources:' section.
-            """)
-            brief = _run_with_retries(
-                lambda: _check_run(
-                    build_venture_agents()[stage_id].run(revision_prompt),
-                    f"{stage_label} revision failed",
-                ),
-                f"{stage_label} revision",
-            )
 
-        findings[stage_id] = brief
-        yield {"type": "stage_done", "stage": stage_id}
-
-    yield {
-        "type": "stage_start",
-        "stage": "report",
-        "label": "Synthesising report",
-        "detail": "Lead analyst assembling the Venture Intelligence Report",
-    }
-    prompt = venture_report_prompt(idea, findings)
+def _stream_synthesis(prompt: str) -> Iterator[dict]:
+    """Stream the final report, restarting generation on transient failure."""
     emitted_deltas = False
     attempt = 0
     while True:
@@ -1250,7 +1544,7 @@ def run_venture_pipeline(idea: str) -> Iterator[dict]:
                 )
                 break
         if failure is None:
-            break
+            return
         if attempt < _STAGE_MAX_ATTEMPTS and _is_transient_error(failure):
             # Mid-stream failure: restart generation from scratch. The reset
             # event tells the client to drop the partial report text.
@@ -1260,7 +1554,7 @@ def run_venture_pipeline(idea: str) -> Iterator[dict]:
             _clear_synthesis_agent()
             wait = _STAGE_RETRY_DELAY * attempt
             print(
-                f"[jaspa] transient provider error in report synthesis "
+                f"[thrace] transient provider error in report synthesis "
                 f"(attempt {attempt}/{_STAGE_MAX_ATTEMPTS}); restarting in {wait}s — "
                 f"{str(failure)[:200]}",
                 flush=True,
@@ -1268,6 +1562,80 @@ def run_venture_pipeline(idea: str) -> Iterator[dict]:
             time.sleep(wait)
             continue
         raise failure
+
+
+def run_venture_pipeline(idea: str) -> Iterator[dict]:
+    """Run the 5-stage venture pipeline, yielding SSE-ready event dicts.
+
+    Shape: an instant provisional read, then research in two waves (validation;
+    then the other four concurrently), then the final report streams. Events:
+    status / stage_start / stage_done while researching, then
+    stage_start("report") followed by delta events.
+    """
+    started = time.monotonic()
+    deadline = started + _VENTURE_BUDGET_SECONDS
+    findings: dict[str, str] = {}
+    revision_budget = _RevisionBudget(_MAX_REVISIONS_PER_RUN)
+
+    # 1. Instant preliminary read — something on screen within ~1-2s.
+    yield {
+        "type": "status",
+        "label": "Preliminary read",
+        "detail": "Drafting an immediate first impression before research runs…",
+    }
+    yield from _stream_provisional(
+        "Thrace Quick Read",
+        dedent("""
+            You give founders an immediate, honest first read on a business idea
+            before any research has been done. You are concise, specific and
+            never invent figures, market sizes or sources.
+        """),
+        dedent(f"""
+            A founder is considering this venture: "{idea}"
+
+            Give your immediate preliminary read in under 120 words:
+            - one bold verdict line (looks promising / needs work / weak)
+            - the single biggest opportunity
+            - the single biggest risk
+
+            Markdown, no headings, no sources — a seasoned investor's gut read.
+        """),
+    )
+
+    # 2. Wave 1 — validation establishes the base case every later stage reads.
+    yield from _run_wave([VENTURE_STAGES[0]], idea, findings, deadline, revision_budget)
+
+    # 3. Wave 2 — the remaining four stages run concurrently. This is the main
+    #    speed win: five sequential stages become two waves.
+    yield from _run_wave(
+        VENTURE_STAGES[1:], idea, findings, deadline, revision_budget
+    )
+
+    # 4. Final report — drop the provisional text, stream the researched one.
+    yield {"type": "reset"}
+    yield {
+        "type": "stage_start",
+        "stage": "report",
+        "label": "Synthesising report",
+        "detail": "Lead analyst assembling the Venture Intelligence Report",
+    }
+    prompt = venture_report_prompt(idea, findings)
+    missing = [s["label"] for s in VENTURE_STAGES if s["id"] not in findings]
+    if missing:
+        prompt += dedent(f"""
+
+            NOTE: These research stages did not complete in time: {", ".join(missing)}.
+            Write the report from the briefs you have, and add a single line under
+            "Executive Verdict" headed "Research gaps" naming the missing sections
+            so the reader knows what was not covered.
+        """)
+    print(
+        f"[thrace] venture research done in {time.monotonic() - started:.1f}s "
+        f"({len(findings)}/5 stages); synthesising",
+        flush=True,
+    )
+    yield from _stream_synthesis(prompt)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1298,73 +1666,132 @@ def monitor_report(query: str, prior_report: str | None) -> str:
 def run_discovery(focus: str) -> Iterator[dict]:
     """Scan live signals and propose ideas worth validating.
 
-    Streams the scan log as deltas, then emits structured `idea` events
-    parsed from the agent's final output, then `done`.
+    Streams the scan log as deltas. Each idea is emitted the moment its block
+    is finished rather than once the whole scan is over, so cards (and their
+    validate buttons) appear while the agent is still searching. At most
+    `DISCOVERY_MAX_IDEAS` ideas are produced.
     """
     focus_line = f"Focus: {focus}" if focus else "Focus: Nigeria (any high-potential sector)"
     prompt = dedent(f"""
-        Scan today's news, trends and local market signals and propose 4-6
-        business ideas worth validating. {focus_line}
-        Search for emerging demand, supply gaps, policy changes,
-        infrastructure shifts and rising consumer trends first, then propose
-        the ideas in the required format.
+        Scan today's news, trends and local market signals and propose exactly
+        {DISCOVERY_MAX_IDEAS} business ideas worth validating. {focus_line}
+        Keep the scan tight — run at most {DISCOVERY_MAX_IDEAS} searches — then
+        propose the ideas in the required format. Search for emerging demand,
+        supply gaps, policy changes, infrastructure shifts and rising consumer
+        trends first.
     """)
     yield {"type": "status", "label": "Scanning live signals", "detail": "Searching news, trends and market signals…"}
 
     content = ""
     failure: Exception | None = None
+    emitted = 0
+    consumed = 0
+
+    def drain_finished_blocks() -> Iterator[dict]:
+        """Emit every idea block the agent has finished writing so far."""
+        nonlocal consumed, emitted
+        blocks, _ = _split_idea_blocks(content)
+        while consumed < len(blocks) and emitted < DISCOVERY_MAX_IDEAS:
+            block = blocks[consumed]
+            consumed += 1
+            idea = _parse_idea_block(block)
+            if idea is not None:
+                emitted += 1
+                yield idea
+
     for event in _discovery_agent().run(prompt, stream=True):
         if isinstance(event, AgentRunContentEvent):
             if event.content:
                 content += event.content
                 yield {"type": "delta", "data": event.content}
+                for idea in drain_finished_blocks():
+                    yield {"type": "idea", **idea}
         elif isinstance(event, AgentRunErrorEvent):
             failure = RuntimeError(
                 f"Discovery scan failed: {event.content or event.error_type or 'unknown'}"
             )
     if failure is not None:
         raise failure
+
     if not content.strip():
+        # The streamed run produced nothing — retry once without streaming.
         content = _run_with_retries(
             lambda: _check_run(_discovery_agent().run(prompt), "Discovery scan failed"),
             "Discovery",
         )
+        for idea in drain_finished_blocks():
+            yield {"type": "idea", **idea}
 
-    for idea in _parse_ideas(content):
-        yield {"type": "idea", **idea}
+    # The final block has no following header to close it, so flush the rest.
+    finished, tail = _split_idea_blocks(content)
+    remaining = finished[consumed:]
+    if tail.strip():
+        remaining = [*remaining, tail]
+    for block in remaining:
+        if emitted >= DISCOVERY_MAX_IDEAS:
+            break
+        idea = _parse_idea_block(block)
+        if idea is not None:
+            emitted += 1
+            yield {"type": "idea", **idea}
+
+    if emitted == 0:
+        # Some models drift from the '### ' format — fall back to a lenient pass.
+        for idea in _parse_ideas(content)[:DISCOVERY_MAX_IDEAS]:
+            yield {"type": "idea", **idea}
+
     yield {"type": "done"}
 
 
+def _split_idea_blocks(content: str) -> tuple[list[str], str]:
+    """Separate finished idea blocks from the one still being written.
+
+    A block is finished once the agent has started the next `### ` header, so
+    the trailing chunk is the block currently arriving.
+    """
+    parts = re.split(r"^###\s+", content, flags=re.MULTILINE)
+    if len(parts) <= 1:
+        return [], ""
+    return parts[1:-1], parts[-1]
+
+
+def _parse_idea_block(block: str) -> dict | None:
+    """Parse one '### Title / idea: / why:' block, or None if it is not one."""
+    block = block.strip()
+    if not block:
+        return None
+    title = block.splitlines()[0].strip()
+    idea_line, why_line = "", ""
+    for ln in block.splitlines():
+        low = ln.strip().lower()
+        if low.startswith("idea:"):
+            idea_line = ln.strip()[5:].strip()
+        elif low.startswith("why:"):
+            why_line = ln.strip()[4:].strip()
+    if not idea_line:
+        return None
+    return {
+        "title": title or idea_line[:60],
+        "prompt": idea_line,
+        "rationale": why_line,
+    }
+
+
 def _parse_ideas(content: str) -> list[dict]:
-    """Parse the discovery agent's strict output format into idea dicts."""
-    ideas: list[dict] = []
-    blocks = re.split(r"^###\s+", content, flags=re.MULTILINE)
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        title = block.splitlines()[0].strip()
-        idea_line, why_line = "", ""
-        for ln in block.splitlines():
-            low = ln.strip().lower()
-            if low.startswith("idea:"):
-                idea_line = ln.strip()[5:].strip()
-            elif low.startswith("why:"):
-                why_line = ln.strip()[4:].strip()
-        if idea_line:
-            ideas.append(
-                {
-                    "title": title or idea_line[:60],
-                    "prompt": idea_line,
-                    "rationale": why_line,
-                }
-            )
-    return ideas
+    """Lenient fallback: parse every '### ' block in a finished scan."""
+    blocks = re.split(r"^###\s+", content, flags=re.MULTILINE)[1:]
+    return [idea for idea in (_parse_idea_block(b) for b in blocks) if idea is not None]
 
 
-def answer_question(report: str, question: str) -> Iterator[dict]:
-    """Answer a follow-up question strictly from the given report (streamed)."""
+def answer_question(report: str, question: str, subject: str = "") -> Iterator[dict]:
+    """Answer a follow-up question strictly from the given report (streamed).
+
+    `subject` is the chat's original query — the company or idea the report is
+    about — so a long conversation stays anchored to that subject instead of
+    drifting into a fresh analysis.
+    """
     clipped = report[:15000]
+    anchor = f" The report is about {subject.strip()}." if subject.strip() else ""
     prompt = dedent(f"""
         === INTELLIGENCE REPORT ===
         {clipped}
@@ -1372,7 +1799,9 @@ def answer_question(report: str, question: str) -> Iterator[dict]:
         === QUESTION ===
         {question}
 
-        Answer the question using ONLY the report above.
+        Answer the question using ONLY the report above.{anchor}
+        If the report does not contain the answer, say so briefly — do not
+        start a new analysis and do not invent findings.
     """)
     yield {"type": "status", "label": "Searching report", "detail": "Reasoning over the report's evidence…"}
 
@@ -1389,6 +1818,9 @@ def answer_question(report: str, question: str) -> Iterator[dict]:
             )
     if failure is not None and not emitted:
         raise failure
+    if not emitted:
+        # A Q&A turn must never close with a blank answer on screen.
+        raise RuntimeError("The report did not yield an answer — try rephrasing the question.")
     yield {"type": "done"}
 
 

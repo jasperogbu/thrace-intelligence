@@ -57,7 +57,9 @@ export interface Run {
   exchanges: Exchange[]
 }
 
-const STORAGE_KEY = "jaspa_runs_v1"
+const STORAGE_KEY = "thrace_runs_v1"
+/** Pre-rename key — read once as a fallback so existing local history survives. */
+const LEGACY_STORAGE_KEY = "jaspa_runs_v1"
 const MAX_PERSISTED = 60
 const POLL_INTERVAL = 30_000
 const MODES: RunMode[] = [
@@ -166,7 +168,8 @@ function sanitizeRuns(raw: unknown): Run[] {
 
 function loadPersisted(): { runs: Run[]; activeId: string | null } | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    let raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) raw = localStorage.getItem(LEGACY_STORAGE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw) as { runs?: unknown; activeId?: unknown }
     return {
@@ -525,10 +528,11 @@ export function useAnalyze() {
 
     let stream: Promise<void>
     if (mode === "ask") {
-      // Report Q&A: answer from the chat's latest report instead of a full run.
-      const report = (target ?? runsRef.current.find((r) => r.id === runId))
-        ?.exchanges.filter((e) => e.content.trim())
-        .at(-1)?.content
+      // Report Q&A: ground every follow-up on the chat's original report, not
+      // on the previous answer — otherwise a long conversation drifts away
+      // from the company or idea the chat is actually about.
+      const chat = target ?? runsRef.current.find((r) => r.id === runId)
+      const report = chat?.exchanges.find((e) => e.content.trim())?.content
       if (!report) {
         patchExchange({
           status: "error",
@@ -536,7 +540,7 @@ export function useAnalyze() {
         })
         return
       }
-      stream = streamAsk(report, query, onEvent, controller.signal)
+      stream = streamAsk(report, query, onEvent, controller.signal, chat?.query)
     } else if (mode === "venture") {
       stream = streamVenture(query, onEvent, controller.signal)
     } else if (mode === "competitor" || mode === "sentiment" || mode === "metrics") {

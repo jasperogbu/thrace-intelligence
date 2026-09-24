@@ -163,13 +163,13 @@
 }
 
 /* Ultra-compact (e.g. Galaxy Fold cover display, 320px) — shrink the
-   mono/data type a notch so nothing overflows. */
+   mono/data type a notch so nothing overflows, but stay legible. */
 @media (max-width: 380px) {
   .text-data {
-    font-size: 0.66rem;
+    font-size: 0.7rem;
   }
   .text-data-sm {
-    font-size: 0.56rem;
+    font-size: 0.64rem;
   }
 }
 
@@ -224,14 +224,14 @@
 
   .text-data {
     font-family: var(--font-mono);
-    font-size: 0.72rem;
+    font-size: 0.75rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
 
   .text-data-sm {
     font-family: var(--font-mono);
-    font-size: 0.62rem;
+    font-size: 0.68rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
   }
