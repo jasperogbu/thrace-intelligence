@@ -195,30 +195,107 @@ real_live_search = intelligence._live_search
 intelligence._live_search = lambda query, limit: []  # simulate no search backend
 
 bad_cases = []
-for query in (
+SOURCE_QUERIES = (
     "fintech in Lagos",
     "agriculture marketplace for farmers",
     "crypto exchange",
     "logistics",
     "education platform",
-):
-    collector = intelligence.SourceCollector(query)
+    "health clinic Nigeria",
+    "solar cold chain",
+    "AI bookkeeping for Nigerian SMEs",
+    "manufacturing export Nigeria",
+    "creative freelancer hub",
+    "zzz qqq",
+    "Paystack",
+    "Flutterwave",
+    "",
+)
+import re as _re  # noqa: E402
+
+
+def _links(block: str) -> list[str]:
+    return _re.findall(r"^- \[[^\]]+\]\((https?://[^)]+)\)$", block, _re.M)
+
+
+for query in SOURCE_QUERIES:
+    collector = intelligence.SourceCollector(query or "Nigeria business opportunities")
     collector._run()
-    srcs = collector._sources
-    urls = [s["url"] for s in srcs]
-    ok = (
-        intelligence.MIN_SOURCES <= len(srcs) <= intelligence.MAX_SOURCES
+    urls = _links(intelligence.render_sources(collector._sources))
+    if not (
+        intelligence.MIN_SOURCES <= len(urls) <= intelligence.MAX_SOURCES
         and len(set(urls)) == len(urls)
-        and all(u.startswith("http") for u in urls)
-    )
-    if not ok:
-        bad_cases.append((query, len(srcs)))
+    ):
+        bad_cases.append((query, len(urls)))
 
 check(
-    "every report reaches 3-5 deduped real sources",
+    "every query yields 3-5 deduped real source links",
     not bad_cases,
     f"offenders={bad_cases}",
 )
+
+# The top-up must be unconditional, not merely a fallback for a dead backend:
+# live search routinely returns one usable link, and shipping a one-line
+# Sources section reads as a bug.
+intelligence._live_search = lambda query, limit: [
+    {"label": "One live result", "url": "https://example.com/a"}
+]
+_thin = intelligence.SourceCollector("fintech in Lagos")
+_thin._run()
+_thin_urls = _links(intelligence.render_sources(_thin._sources))
+check(
+    "a single live result is topped up to the floor",
+    len(_thin_urls) >= intelligence.MIN_SOURCES,
+    f"n={len(_thin_urls)}",
+)
+check(
+    "live results are kept ahead of filler",
+    _thin_urls[0] == "https://example.com/a",
+    f"first={_thin_urls[0]}",
+)
+
+intelligence._live_search = lambda query, limit: [
+    {"label": "Dup", "url": "https://example.com/a"}
+] * 3
+_dupes = intelligence.SourceCollector("agriculture")
+_dupes._run()
+_dup_urls = _links(intelligence.render_sources(_dupes._sources))
+check(
+    "duplicate live results are deduped and topped up",
+    len(_dup_urls) >= intelligence.MIN_SOURCES
+    and len(set(_dup_urls)) == len(_dup_urls),
+    f"n={len(_dup_urls)}",
+)
+
+# render_sources is the last line of defence for any caller.
+check(
+    "render_sources tops up a short list passed directly",
+    len(
+        _links(
+            intelligence.render_sources(
+                [{"label": "Solo", "url": "https://example.com/only"}]
+            )
+        )
+    )
+    >= intelligence.MIN_SOURCES,
+)
+check(
+    "render_sources caps an over-long list",
+    len(
+        _links(
+            intelligence.render_sources(
+                [{"label": f"S{i}", "url": f"https://example.com/{i}"} for i in range(12)]
+            )
+        )
+    )
+    == intelligence.MAX_SOURCES,
+)
+check(
+    "render_sources still emits nothing for an empty list",
+    intelligence.render_sources([]) == "",
+)
+intelligence._live_search = real_live_search
+
 check(
     "a local query is led by a local regulator",
     intelligence._official_fallback("fintech in Lagos")[0]["url"].endswith("cbn.gov.ng"),

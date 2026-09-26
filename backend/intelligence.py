@@ -256,6 +256,10 @@ def stream_agent(agent_factory: Callable[[], object], prompt: str) -> Iterator[d
 # 3-5, so the curated floor is set to 4 and live search is capped to match.
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "5"))
 MIN_SOURCES = int(os.getenv("MIN_SOURCES", "3"))
+# How many sources we aim for when the query actually matches that many real
+# bodies. Above the floor so a well-matched query gets 4 useful links rather
+# than 3, below the cap so we never pad a list out to 5 with filler.
+TARGET_SOURCES = int(os.getenv("TARGET_SOURCES", "4"))
 
 # Wall-clock budget for source retrieval. The report is already streaming by
 # the time this matters, so the only cost of a slow backend is a short pause
@@ -504,65 +508,70 @@ class SourceCollector:
         return self
 
     def _run(self) -> None:
+        """Assemble the Sources list, guaranteeing MIN..MAX real links.
+
+        Three tiers, in descending relevance, each filling only what the tier
+        above left short:
+
+        1. live search results (most specific, so they always come first)
+        2. curated official bodies scored against the query
+        3. broad cross-sector bodies
+
+        The top-up is unconditional, not just a fallback for a dead search
+        backend. Live search routinely returns one or two usable links, and
+        shipping a one-line Sources section reads as a bug rather than as
+        restraint. Dedup is by URL, and the result is capped at `limit`.
+        """
         found: list[dict] = []
         seen: set[str] = set()
-        # A couple of narrow queries beat one broad one: the first asks about
-        # the subject, the second about the market around it.
-        queries = [self.query.strip()][:1]
-        if len(self.query.strip()) > 8:
-            queries.append(f"{self.query.strip()} market size report")
+
+        def add(label: str, url: str) -> bool:
+            if url in seen or len(found) >= self.limit:
+                return False
+            seen.add(url)
+            found.append({"label": label, "url": url})
+            return True
+
+        # 1. Live search. A couple of narrow queries beat one broad one: the
+        #    first asks about the subject, the second about the market around
+        #    it.
+        base = self.query.strip()
+        queries = [base] if base else []
+        if len(base) > 8:
+            queries.append(f"{base} market size report")
 
         for query in queries[:MAX_LIVE_QUERIES]:
             try:
                 for src in _live_search(query, limit=3):
-                    if src["url"] in seen:
-                        continue
-                    seen.add(src["url"])
-                    found.append(src)
+                    add(src["label"], src["url"])
             except Exception as exc:  # noqa: BLE001
                 # A dead search backend is expected and survivable.
                 print(f"[thrace] source retrieval failed: {str(exc)[:160]}", flush=True)
                 break
 
-        if not found:
-            # Curated fallback, scored for relevance. `seen` is seeded from the
-            # first pass so the top-up below cannot re-add an entry (it scored
-            # against a different limit and returns the same prefix).
-            found = _official_fallback(self.query, limit=self.limit)
-            seen.update(src["url"] for src in found)
-            # Every remaining keyword-matched body, still in score order.
-            if len(found) < MIN_SOURCES:
-                for src in _official_fallback(
-                    self.query, limit=len(_OFFICIAL_SOURCES)
-                ):
-                    if len(found) >= MIN_SOURCES:
-                        break
-                    if src["url"] not in seen:
-                        seen.add(src["url"])
-                        found.append(src)
-            # Still thin (a narrow query like "crypto exchange" matches one
-            # body). Top up with broad cross-sector bodies so the report ends
-            # with a useful list rather than a one-line stub. Relevance always
-            # wins: these are only reached after every match has been used.
-            if len(found) < MIN_SOURCES:
-                for label, url in _GENERAL_FILLERS:
-                    if len(found) >= MIN_SOURCES:
-                        break
-                    if url not in seen:
-                        seen.add(url)
-                        found.append({"label": label, "url": url})
+        # 2. Curated official bodies, most relevant first. Fills up to
+        #    TARGET_SOURCES so a well-matched query gets more than the bare
+        #    floor, but only with bodies that actually scored. `limit` is the
+        #    full list so ranking, not truncation, decides the order.
+        if len(found) < TARGET_SOURCES:
+            for src in _official_fallback(base, limit=len(_OFFICIAL_SOURCES)):
+                if len(found) >= TARGET_SOURCES:
+                    break
+                add(src["label"], src["url"])
+
+        # 3. Broad cross-sector bodies, for queries too narrow to score
+        #    anything (e.g. "crypto exchange" matches a single regulator).
+        if len(found) < MIN_SOURCES:
+            for label, url in _GENERAL_FILLERS:
+                if len(found) >= MIN_SOURCES:
+                    break
+                add(label, url)
+
         self._sources = found[: self.limit]
 
     def has_sources(self) -> bool:
-        """True once the collector is done and produced something.
-
-        The generic floor sources are added when live retrieval finds nothing
-        *and* the curated list would otherwise be too thin to be useful — a
-        one- or two-link Sources block reads as a bug, not as restraint. The
-        brief asks for 3-5 real links on every report, so we top up with
-        sector-generic official bodies rather than shipping a stub section.
-        """
-        return len(self._sources) >= MIN_SOURCES
+        """True once the collector has produced a full, renderable list."""
+        return MIN_SOURCES <= len(self._sources) <= MAX_SOURCES
 
     def results(self, budget: float = SOURCE_BUDGET_SECONDS) -> list[dict]:
         """Wait up to `budget` seconds for the thread, then take what we have."""
@@ -578,11 +587,35 @@ def render_sources(sources: list[dict]) -> str:
     report never cites [1]/[2], and every link is a real URL that was either
     returned by search or is a known official body. `markdown.tsx` already
     renders these as clickable external links.
+
+    The 3-5 rule is enforced here as well as in the collector, so no caller can
+    emit a stub Sources section by passing a short list. Short lists are topped
+    up from the broad tier; long ones are capped; duplicates are dropped.
     """
     if not sources:
         return ""
-    lines = ["", "## Sources", ""]
+
+    picked: list[dict] = []
+    seen: set[str] = set()
     for src in sources:
+        url = src.get("url", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        picked.append(src)
+
+    # A caller that skipped the collector still gets a usable list. Filler is
+    # only added up to the floor, never to pad a list out to the target.
+    for label, url in _GENERAL_FILLERS:
+        if len(picked) >= MIN_SOURCES:
+            break
+        if url not in seen:
+            seen.add(url)
+            picked.append({"label": label, "url": url})
+
+    picked = picked[:MAX_SOURCES]
+    lines = ["", "## Sources", ""]
+    for src in picked:
         lines.append(f"- [{src['label']}]({src['url']})")
     lines.append("")
     return "\n".join(lines)
