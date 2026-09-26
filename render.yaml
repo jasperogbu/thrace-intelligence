@@ -44,6 +44,12 @@ services:
         sync: false
 
       # --- Model provider ---
+      # LLM_MODEL decides the client: ids starting with "gemini" use Google's
+      # native SDK, anything else uses an OpenAI-compatible endpoint. Pinning
+      # it means GEMINI_API_KEY alone is unambiguously sufficient, instead of
+      # relying on the backend's own default.
+      - key: LLM_MODEL
+        value: gemini-3.8-flash
       - key: GEMINI_API_KEY
         sync: false
       - key: FIRECRAWL_API_KEY

@@ -155,7 +155,36 @@ def _make_tools() -> FirecrawlTools:
 TOOLS = _make_tools
 
 # Default model; override with LLM_MODEL in .env (e.g. a router/gateway model id).
-MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+# Model used when the deployment supplies a Gemini key but no explicit model id.
+# Documented setup (and render.yaml) asks for GEMINI_API_KEY alone, so this is
+# the path almost every install takes.
+_DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+
+
+def _default_model() -> str:
+    """Choose a model id when LLM_MODEL is not set explicitly.
+
+    `_chat_model` routes on the model id: ids beginning with "gemini" go through
+    Google's native SDK, anything else through an OpenAI-compatible endpoint.
+    Defaulting unconditionally to gpt-4o therefore sent a Gemini-only
+    configuration down the OpenAI route, where it failed with "OPENAI_API_KEY
+    not set" — while `/api/health` still reported the service ready, because the
+    readiness check only looked for the presence of *a* key rather than the key
+    the chosen route actually needs.
+
+    Defaulting by the key that is present removes that class of misrouting
+    entirely: a Gemini key now yields a Gemini model, and any other
+    configuration keeps the historical gpt-4o default.
+    """
+    explicit = os.getenv("LLM_MODEL", "").strip()
+    if explicit:
+        return explicit
+    if os.getenv("GEMINI_API_KEY"):
+        return _DEFAULT_GEMINI_MODEL
+    return "gpt-4o"
+
+
+MODEL = _default_model()
 
 # Per-call retry budget for transient provider errors. Deliberately minimal:
 # the model layer rotates to a healthy model on its own, so sleeping inside a
@@ -564,21 +593,46 @@ FEATURE_NAMES = [
 ]
 
 
+def _model_key() -> str:
+    """The API key the currently selected model route will actually use.
+
+    Mirrors `_chat_model`. A readiness check that only asked "is *any* key
+    present" would report ready for a route with no usable key — which is how a
+    Gemini-keyed deployment could serve a healthy /api/health and then fail
+    every single report.
+    """
+    if MODEL.lower().startswith("gemini"):
+        return (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or ""
+        )
+    return os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+
+
 def team_status() -> dict:
     """Readiness for /api/health and the pre-flight check on every route.
 
-    A model key is required. FIRECRAWL_API_KEY is NOT — source retrieval is
-    optional by design, and a missing or out-of-credits key only costs the user
-    their Sources block, never their report.
+    A model key is required, and it must be one the selected route can use.
+    FIRECRAWL_API_KEY is NOT required — source retrieval is optional by
+    design, and a missing or out-of-credits key only costs the user their
+    Sources block, never their report.
     """
-    ready = bool(
-        os.getenv("LLM_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-    )
+    ready = bool(_model_key())
+    if ready:
+        error = None
+    elif MODEL.lower().startswith("gemini"):
+        error = f"No API key for the selected model ({MODEL}). Set GEMINI_API_KEY."
+    else:
+        error = (
+            f"No API key for the selected model ({MODEL}). Set LLM_API_KEY or "
+            "OPENAI_API_KEY, or set LLM_MODEL to a gemini model to use "
+            "GEMINI_API_KEY."
+        )
     return {
         "ready": ready,
-        "error": None if ready else "No model key configured.",
+        "error": error,
         "model": MODEL,
         "pipelines": ["venture", "xray", "discovery"],
         "agents": FEATURE_NAMES,
