@@ -18,6 +18,27 @@ TURSO_URL = os.getenv("TURSO_DATABASE_URL", "")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 
+# Render (and every other PaaS with an ephemeral container filesystem) wipes
+# local disk on every deploy, restart and spin-down. A local SQLite file there
+# means every registered account silently disappears within minutes — the exact
+# failure this guard exists to prevent.
+#
+# So on a PaaS, refuse to start without a durable remote database rather than
+# coming up healthy and quietly losing everyone's credentials. Set
+# ALLOW_EPHEMERAL_DB=1 to override deliberately (e.g. a throwaway preview).
+ON_PAAS = bool(os.getenv("RENDER") or os.getenv("DYNO") or os.getenv("KUBERNETES_SERVICE_HOST"))
+ALLOW_EPHEMERAL_DB = os.getenv("ALLOW_EPHEMERAL_DB", "") == "1"
+
+if ON_PAAS and not USE_TURSO and not ALLOW_EPHEMERAL_DB:
+    raise RuntimeError(
+        "Refusing to start: this host has an ephemeral filesystem, so a local "
+        "SQLite file would be deleted on every deploy or restart and every user "
+        "account would be lost.\n\n"
+        "Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to a remote durable "
+        "database before deploying. To run deliberately without one, set "
+        "ALLOW_EPHEMERAL_DB=1 (accounts will NOT survive a restart)."
+    )
+
 _lock = threading.Lock()
 
 

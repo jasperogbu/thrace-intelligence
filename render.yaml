@@ -1,5 +1,16 @@
-# Render blueprint — single free web service serving API + frontend.
+# Render blueprint — single web service serving API + frontend.
 # Docs: https://render.com/docs/blueprint-spec
+#
+# PRODUCTION STORAGE
+# ------------------
+# The filesystem on Render is ephemeral: it is wiped on every deploy, every
+# restart, and every spin-down of a free instance. A local SQLite file there
+# would delete every registered account within minutes.
+#
+# Therefore TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are REQUIRED. The backend
+# refuses to boot on a PaaS without them (see backend/store.py) rather than
+# starting healthy and silently losing data. Accounts live in Turso and
+# survive every deploy and restart.
 services:
   - type: web
     name: thrace
@@ -14,21 +25,47 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
+      # --- Versions (pinned; free plan is sensitive to drift) ---
       - key: PYTHON_VERSION
         value: 3.13.5
       - key: NODE_VERSION
         value: 22.4.0
+
+      # --- Durable database (REQUIRED in production) ---
+      # Create a Turso database at https://turso.tech, then paste its
+      # connection URL and auth token here. See the deployment guide.
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+
+      # --- Model provider ---
       - key: GEMINI_API_KEY
         sync: false
       - key: FIRECRAWL_API_KEY
         sync: false
+
+      # --- Authentication ---
+      # AUTH_SECRET signs the JWT sessions. It is generated once and must
+      # stay the same forever: changing it logs every existing user out.
+      - key: AUTH_SECRET
+        generateValue: true
       - key: GOOGLE_CLIENT_ID
         sync: false
       - key: GOOGLE_CLIENT_SECRET
         sync: false
-      - key: AUTH_SECRET
-        generateValue: true
-      - key: TURSO_DATABASE_URL
+
+      # --- Password-reset email (optional) ---
+      # Without SMTP_HOST the reset link is returned in the API response
+      # instead of being emailed, so the flow works but is not suitable for
+      # real users. Configure these before launch.
+      - key: SMTP_HOST
         sync: false
-      - key: TURSO_AUTH_TOKEN
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
         sync: false
