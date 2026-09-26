@@ -1,20 +1,27 @@
 """Authentication for Thrace: bcrypt password hashing + JWT session tokens
-+ Google OAuth 2.0 sign-in.
++ Google OAuth 2.0 sign-in + password reset by emailed link.
 
 Sessions are stateless JWTs signed with AUTH_SECRET (from .env; a dev default
 is used when unset). The token is sent by the client as a Bearer header and
-resolved by the `current_user` FastAPI dependency.
+resolved by the `resolve_user` FastAPI dependency.
+
+Password reset uses a single-use, time-limited token. Only its SHA-256 digest
+is stored, so the database never holds a usable reset link. Delivery is over
+SMTP when SMTP_HOST is configured; otherwise the link is returned in the API
+response so the flow remains testable without a mail server. See `send_reset_email`.
 """
+import hashlib
+import logging
 import os
 import secrets
+import smtplib
 import time
+from email.message import EmailMessage
 from typing import Optional
-from urllib.parse import urlencode
 
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException
-from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import store
@@ -108,6 +115,142 @@ def require_user(user: Optional[dict] = Depends(resolve_user)) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="Sign in to use this feature.")
     return user
+
+
+# ---------------------------------------------------------------------------
+# Password reset
+# ---------------------------------------------------------------------------
+# 1 hour is long enough to find the email and short enough to limit the window
+# in which a link sitting in an inbox is usable.
+RESET_TTL_SECONDS = int(os.getenv("RESET_TOKEN_TTL_SECONDS", "3600"))
+# Throttle: one request per address per 60s. Keyed on the address so it also
+# covers unknown addresses without revealing whether they exist.
+RESET_THROTTLE_SECONDS = int(os.getenv("RESET_THROTTLE_SECONDS", "60"))
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "") or SMTP_USER
+
+# Deliberately identical whether or not the address exists, so the endpoint
+# cannot be used to discover which emails have accounts.
+_RESET_GENERIC_MSG = (
+    "If that email has a Thrace account, a reset link is on its way."
+)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _reset_link(token: str) -> str:
+    """The user-facing reset URL, pointed at the frontend."""
+    return f"{FRONTEND_ORIGIN.rstrip('/')}/auth?reset_token={token}"
+
+
+def smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_FROM)
+
+
+def send_reset_email(to_email: str, token: str) -> bool:
+    """Send the reset link over SMTP. Returns True if it was actually sent.
+
+    Delivery failure is never surfaced to the caller as an error: the user gets
+    the same generic confirmation either way, which both avoids leaking whether
+    an account exists and stops a mail outage from blocking the flow.
+    """
+    if not smtp_configured():
+        return False
+    link = _reset_link(token)
+    msg = EmailMessage()
+    msg["Subject"] = "Reset your Thrace password"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(
+        "Someone requested a password reset for your Thrace account.\n\n"
+        f"Open this link within {RESET_TTL_SECONDS // 60} minutes to choose a "
+        f"new password:\n\n{link}\n\n"
+        "If you did not request this, you can ignore this email — your current "
+        "password still works."
+    )
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            if SMTP_USER and SMTP_PASSWORD:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("[thrace] password reset email failed: %s", str(exc)[:200])
+        return False
+
+
+def request_password_reset(email: str) -> dict:
+    """Start a password reset for `email`.
+
+    Always returns the same generic message. Returns `dev_token` only when no
+    SMTP server is configured, so the flow is usable without mail; that field
+    is absent whenever real delivery is available.
+    """
+    email = email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    if store.password_reset_requested_recently(
+        email, time.time() - RESET_THROTTLE_SECONDS
+    ):
+        # Throttled. Still generic, still no token.
+        return {"message": _RESET_GENERIC_MSG}
+
+    user = store.get_user_by_email(email)
+    if not user:
+        # Unknown address: do nothing, and reveal nothing.
+        return {"message": _RESET_GENERIC_MSG}
+
+    token = secrets.token_urlsafe(32)
+    store.create_password_reset(
+        user_id=user["id"],
+        token_hash=_hash_token(token),
+        expires_at=time.time() + RESET_TTL_SECONDS,
+        created_at=time.time(),
+    )
+    sent = send_reset_email(email, token)
+    result: dict = {"message": _RESET_GENERIC_MSG}
+    if not smtp_configured():
+        # Dev fallback: hand the link back so the feature is demonstrable
+        # without a mail server. Never returned when SMTP is configured.
+        result["dev_token"] = token
+    elif not sent:
+        result["delivered"] = False
+    return result
+
+
+def reset_password(token: str, new_password: str) -> dict:
+    """Complete a reset: validate the token and set a new password."""
+    token = (token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="This reset link is not valid.")
+    if len(new_password) < _MIN_PASSWORD_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {_MIN_PASSWORD_LEN} characters.",
+        )
+
+    row = store.get_password_reset(_hash_token(token))
+    if not row:
+        # Covers unknown, expired and already-used tokens identically.
+        raise HTTPException(
+            status_code=400,
+            detail="This reset link has expired or has already been used. "
+            "Request a new one.",
+        )
+
+    # Single-use: consume before hashing so a failure mid-way cannot leave a
+    # live token behind.
+    store.consume_password_reset(_hash_token(token))
+    store.update_user_password(row["user_id"], hash_password(new_password))
+    return {"message": "Your password has been reset. You can sign in now."}
 
 
 # ---------------------------------------------------------------------------

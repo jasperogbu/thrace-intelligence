@@ -173,6 +173,12 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS password_resets (
+                user_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS discover_scans (
                 user_id TEXT PRIMARY KEY,
                 focus TEXT DEFAULT '',
@@ -469,6 +475,67 @@ def get_user(user_id: str) -> dict | None:
 def update_user_name(user_id: str, name: str) -> None:
     with _lock, _conn() as c:
         c.execute("UPDATE users SET name=? WHERE id=?", (name, user_id))
+
+
+def update_user_password(user_id: str, password_hash: str) -> None:
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Password reset tokens
+# ---------------------------------------------------------------------------
+# Only the SHA-256 of the token is stored, never the token itself, so a read of
+# the database does not yield a usable reset link. `token_hash` is the lookup
+# key; the plaintext exists only in the email (and in the dev-mode response).
+def create_password_reset(
+    user_id: str, token_hash: str, expires_at: float, created_at: float
+) -> None:
+    with _lock, _conn() as c:
+        # One live token per user: a new request supersedes any earlier one.
+        c.execute("DELETE FROM password_resets WHERE user_id=?", (user_id,))
+        c.execute(
+            "INSERT INTO password_resets "
+            "(user_id, token_hash, expires_at, created_at) VALUES (?,?,?,?)",
+            (user_id, token_hash, expires_at, created_at),
+        )
+
+
+def get_password_reset(token_hash: str) -> dict | None:
+    """The live reset row for a token hash, or None if unknown/expired/used."""
+    with _lock, _conn() as c:
+        row = _one_to_dict(
+            c.execute("SELECT * FROM password_resets WHERE token_hash=?", (token_hash,))
+        )
+    if not row or row["expires_at"] < time.time():
+        return None
+    return dict(row)
+
+
+def consume_password_reset(token_hash: str) -> None:
+    """Mark a token used. Single-use: it cannot be replayed after a reset."""
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM password_resets WHERE token_hash=?", (token_hash,))
+
+
+def password_reset_requested_recently(email: str, since: float) -> bool:
+    """Throttle check: has this address asked for a reset very recently?
+
+    Keyed on the address, not the user row, so it also covers the
+    never-registered case without leaking whether the account exists.
+    """
+    with _lock, _conn() as c:
+        row = _one_to_dict(
+            c.execute(
+                "SELECT r.created_at AS created_at FROM password_resets r "
+                "JOIN users u ON u.id = r.user_id WHERE u.email=? "
+                "ORDER BY r.created_at DESC LIMIT 1",
+                (email,),
+            )
+        )
+    return bool(row and row["created_at"] >= since)
 
 
 # ---------------------------------------------------------------------------

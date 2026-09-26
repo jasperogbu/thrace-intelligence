@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Eye, EyeOff, LoaderCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { apiLogin, apiRegister, type User } from "@/lib/api";
+import {
+  apiForgotPassword,
+  apiLogin,
+  apiRegister,
+  apiResetPassword,
+  type User,
+} from "@/lib/api";
 
 interface AuthViewProps {
   onAuthed: (user: User) => void;
@@ -31,6 +37,182 @@ function GoogleIcon({ className }: { className?: string }) {
   );
 }
 
+// Shared field styling, matching the sign-in form exactly.
+const FIELD =
+  "w-full border border-border bg-card/60 px-3 py-2.5 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50";
+const PRIMARY_BTN =
+  "mt-6 h-12 gap-2 border border-primary/40 bg-primary/10 font-mono text-sm tracking-wide text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-40 sm:h-11 sm:text-[13px]";
+
+/** Step 1 — collect the address and start the reset. */
+function ForgotForm({
+  email,
+  setEmail,
+  busy,
+  error,
+  notice,
+  devLink,
+  onSubmit,
+  onBack,
+}: {
+  email: string;
+  setEmail: (v: string) => void;
+  busy: boolean;
+  error: string | null;
+  notice: string | null;
+  devLink: string | null;
+  onSubmit: () => void;
+  onBack: () => void;
+}) {
+  return (
+    <div>
+      <p className="mb-1 text-center font-mono text-[13px] text-muted-foreground">
+        enter the email on your account
+      </p>
+      <p className="mb-6 text-center text-xs leading-relaxed text-muted-foreground/60">
+        we&apos;ll send a link to choose a new password
+      </p>
+
+      <input
+        type="email"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            onSubmit();
+          }
+        }}
+        placeholder="email"
+        autoComplete="email"
+        autoFocus
+        className={FIELD}
+      />
+
+      {error && (
+        <p className="mt-3 border border-destructive/40 bg-destructive/[0.07] px-3 py-2 font-mono text-xs text-destructive">
+          {error}
+        </p>
+      )}
+
+      {notice && (
+        <div className="mt-3 border border-primary/40 bg-primary/[0.07] px-3 py-2">
+          <p className="font-mono text-xs text-primary">{notice}</p>
+          {devLink && (
+            <>
+              <p className="mt-2 font-mono text-[11px] text-muted-foreground/70">
+                no mail server configured — use this link directly:
+              </p>
+              <a
+                href={devLink}
+                className="mt-1 block break-all font-mono text-[11px] text-primary underline decoration-primary/40 underline-offset-2"
+              >
+                {devLink}
+              </a>
+            </>
+          )}
+        </div>
+      )}
+
+      <Button onClick={onSubmit} disabled={busy} className={PRIMARY_BTN}>
+        {busy && <LoaderCircle className="size-3.5 animate-spin" />}
+        <span className="truncate">send_reset_link()</span>
+      </Button>
+
+      <button
+        type="button"
+        onClick={onBack}
+        className="mt-4 inline-flex items-center gap-1.5 self-center font-mono text-xs text-muted-foreground/60 transition-colors hover:text-foreground"
+      >
+        <ArrowLeft className="size-3" />
+        back to sign in
+      </button>
+    </div>
+  );
+}
+
+/** Step 2 — set a new password with the token from the link. */
+function ResetForm({
+  password,
+  setPassword,
+  showPassword,
+  setShowPassword,
+  busy,
+  error,
+  onSubmit,
+  onBack,
+}: {
+  password: string;
+  setPassword: (v: string) => void;
+  showPassword: boolean;
+  setShowPassword: (v: boolean) => void;
+  busy: boolean;
+  error: string | null;
+  onSubmit: () => void;
+  onBack: () => void;
+}) {
+  return (
+    <div>
+      <p className="mb-1 text-center font-mono text-[13px] text-muted-foreground">
+        choose a new password
+      </p>
+      <p className="mb-6 text-center text-xs leading-relaxed text-muted-foreground/60">
+        at least 8 characters
+      </p>
+
+      <div className="relative">
+        <input
+          type={showPassword ? "text" : "password"}
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onSubmit();
+            }
+          }}
+          placeholder="new password"
+          autoComplete="new-password"
+          autoFocus
+          className={`${FIELD} pr-10`}
+        />
+        <button
+          type="button"
+          aria-label={showPassword ? "Hide password" : "Show password"}
+          title={showPassword ? "Hide password" : "Show password"}
+          onClick={() => setShowPassword(!showPassword)}
+          className="absolute right-2 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+        >
+          {showPassword ? (
+            <EyeOff className="size-3.5" />
+          ) : (
+            <Eye className="size-3.5" />
+          )}
+        </button>
+      </div>
+
+      {error && (
+        <p className="mt-3 border border-destructive/40 bg-destructive/[0.07] px-3 py-2 font-mono text-xs text-destructive">
+          {error}
+        </p>
+      )}
+
+      <Button onClick={onSubmit} disabled={busy} className={PRIMARY_BTN}>
+        {busy && <LoaderCircle className="size-3.5 animate-spin" />}
+        <span className="truncate">reset_password()</span>
+      </Button>
+
+      <button
+        type="button"
+        onClick={onBack}
+        className="mt-4 inline-flex items-center gap-1.5 self-center font-mono text-xs text-muted-foreground/60 transition-colors hover:text-foreground"
+      >
+        <ArrowLeft className="size-3" />
+        back to sign in
+      </button>
+    </div>
+  );
+}
+
 export function AuthView({ onAuthed, onBack }: AuthViewProps) {
   const [tab, setTab] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
@@ -41,7 +223,26 @@ export function AuthView({ onAuthed, onBack }: AuthViewProps) {
   const [error, setError] = useState<string | null>(null);
   const popupRef = useRef<Window | null>(null);
 
+  // "signin" is the normal form; "forgot" collects the address; "reset" sets a
+  // new password using the token from the emailed link.
+  const [mode, setMode] = useState<"signin" | "forgot" | "reset">("signin");
+  const [resetToken, setResetToken] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+  const [devLink, setDevLink] = useState<string | null>(null);
+
   const isLogin = tab === "login";
+
+  // A reset link lands on /auth?reset_token=... — go straight to the reset form.
+  useEffect(() => {
+    const token = new URLSearchParams(window.location.search).get(
+      "reset_token",
+    );
+    if (token) {
+      setResetToken(token);
+      setMode("reset");
+      window.history.replaceState({}, "", "/auth");
+    }
+  }, []);
 
   // Receive the OAuth result from the popup window.
   useEffect(() => {
@@ -129,6 +330,67 @@ export function AuthView({ onAuthed, onBack }: AuthViewProps) {
     }
   };
 
+  const submitForgot = async () => {
+    if (busy) return;
+    if (!email.trim()) {
+      setError("Enter the email address on your account.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setDevLink(null);
+    try {
+      const res = await apiForgotPassword(email.trim());
+      setNotice(res.message);
+      // With no SMTP server configured the server hands the link back so the
+      // flow stays demonstrable. Never shown once real mail is configured.
+      if (res.dev_token) {
+        setDevLink(
+          `${window.location.origin}/auth?reset_token=${res.dev_token}`,
+        );
+      }
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Could not start a password reset.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitReset = async () => {
+    if (busy) return;
+    if (!password) {
+      setError("Choose a new password.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiResetPassword(resetToken, password);
+      setNotice(res.message);
+      setPassword("");
+      setMode("signin");
+      window.setTimeout(() => setNotice(null), 8000);
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Could not reset your password.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const backToSignIn = () => {
+    setMode("signin");
+    setError(null);
+    setNotice(null);
+    setDevLink(null);
+    setPassword("");
+  };
+
   return (
     <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
       <div aria-hidden className="pointer-events-none absolute inset-0 -z-10">
@@ -148,7 +410,9 @@ export function AuthView({ onAuthed, onBack }: AuthViewProps) {
         {/* Hero — desktop and laptop only */}
         <div
           className={`hidden w-full xl:flex xl:min-h-0 xl:flex-1 xl:items-center xl:py-12 2xl:py-14 ${
-            isLogin ? "xl:order-1 xl:pl-10 2xl:pl-14" : "xl:order-2 xl:pr-10 2xl:pr-14"
+            isLogin
+              ? "xl:order-1 xl:pl-10 2xl:pl-14"
+              : "xl:order-2 xl:pr-10 2xl:pr-14"
           }`}
         >
           <img
@@ -189,124 +453,170 @@ export function AuthView({ onAuthed, onBack }: AuthViewProps) {
             </p>
           </div>
 
-          {/* Google sign-in */}
-          <Button
-            onClick={() => void signInWithGoogle()}
-            disabled={busy}
-            className="h-12 w-full gap-3 border border-border bg-card font-mono text-sm text-foreground hover:bg-card/70 disabled:opacity-40 sm:h-11 sm:text-[13px]"
-          >
-            <GoogleIcon className="size-4 shrink-0" />
-            <span className="truncate">
-              {isLogin ? "sign in with google" : "sign up with google"}
-            </span>
-          </Button>
-
-          <div className="my-6 flex items-center gap-3">
-            <span className="h-px flex-1 bg-border/70" />
-            <span className="font-mono text-xs text-muted-foreground/60">
-              or
-            </span>
-            <span className="h-px flex-1 bg-border/70" />
-          </div>
-
-          {/* Tab toggle */}
-          <div className="mb-5 inline-flex border border-border/70 bg-card/40 p-1">
-            {(["login", "register"] as const).map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => {
-                  setTab(t);
-                  setError(null);
-                }}
-                className={`flex-1 px-4 py-1.5 font-mono text-xs tracking-wide transition-colors ${
-                  tab === t
-                    ? "bg-primary/[0.10] text-primary"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
+          {/* The sign-in / register form, or the reset sub-forms. */}
+          {mode === "signin" ? (
+            <>
+              {/* Google sign-in */}
+              <Button
+                onClick={() => void signInWithGoogle()}
+                disabled={busy}
+                className="h-12 w-full gap-3 border border-border bg-card font-mono text-sm text-foreground hover:bg-card/70 disabled:opacity-40 sm:h-11 sm:text-[13px]"
               >
-                {t === "login" ? "sign_in()" : "register()"}
-              </button>
-            ))}
-          </div>
+                <GoogleIcon className="size-4 shrink-0" />
+                <span className="truncate">
+                  {isLogin ? "sign in with google" : "sign up with google"}
+                </span>
+              </Button>
 
-          {/* Email form */}
-          <div className="space-y-3">
-            {!isLogin && (
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="name"
-                autoComplete="name"
-                className="w-full border border-border bg-card/60 px-3 py-2.5 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
-              />
-            )}
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void submit();
-                }
-              }}
-              placeholder="email"
-              autoComplete="email"
-              className="w-full border border-border bg-card/60 px-3 py-2.5 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
-            />
-            <div className="relative">
-              <input
-                type={showPassword ? "text" : "password"}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void submit();
-                  }
-                }}
-                placeholder={
-                  isLogin ? "password" : "password (min 8 characters)"
-                }
-                autoComplete={isLogin ? "current-password" : "new-password"}
-                className="w-full border border-border bg-card/60 px-3 py-2.5 pr-10 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
-              />
-              <button
-                type="button"
-                aria-label={showPassword ? "Hide password" : "Show password"}
-                title={showPassword ? "Hide password" : "Show password"}
-                onClick={() => setShowPassword((s) => !s)}
-                className="absolute right-2 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
-              >
-                {showPassword ? (
-                  <EyeOff className="size-3.5" />
-                ) : (
-                  <Eye className="size-3.5" />
+              <div className="my-6 flex items-center gap-3">
+                <span className="h-px flex-1 bg-border/70" />
+                <span className="font-mono text-xs text-muted-foreground/60">
+                  or
+                </span>
+                <span className="h-px flex-1 bg-border/70" />
+              </div>
+
+              {/* Tab toggle */}
+              <div className="mb-5 inline-flex border border-border/70 bg-card/40 p-1">
+                {(["login", "register"] as const).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => {
+                      setTab(t);
+                      setError(null);
+                    }}
+                    className={`flex-1 px-4 py-1.5 font-mono text-xs tracking-wide transition-colors ${
+                      tab === t
+                        ? "bg-primary/[0.10] text-primary"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {t === "login" ? "sign_in()" : "register()"}
+                  </button>
+                ))}
+              </div>
+
+              {/* Email form */}
+              <div className="space-y-3">
+                {!isLogin && (
+                  <input
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="name"
+                    autoComplete="name"
+                    className="w-full border border-border bg-card/60 px-3 py-2.5 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+                  />
                 )}
-              </button>
-            </div>
-          </div>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void submit();
+                    }
+                  }}
+                  placeholder="email"
+                  autoComplete="email"
+                  className="w-full border border-border bg-card/60 px-3 py-2.5 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+                />
+                <div className="relative">
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void submit();
+                      }
+                    }}
+                    placeholder={
+                      isLogin ? "password" : "password (min 8 characters)"
+                    }
+                    autoComplete={isLogin ? "current-password" : "new-password"}
+                    className="w-full border border-border bg-card/60 px-3 py-2.5 pr-10 font-mono text-[13px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+                  />
+                  <button
+                    type="button"
+                    aria-label={
+                      showPassword ? "Hide password" : "Show password"
+                    }
+                    title={showPassword ? "Hide password" : "Show password"}
+                    onClick={() => setShowPassword((s) => !s)}
+                    className="absolute right-2 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    {showPassword ? (
+                      <EyeOff className="size-3.5" />
+                    ) : (
+                      <Eye className="size-3.5" />
+                    )}
+                  </button>
+                </div>
+              </div>
 
-          {error && (
-            <p className="mt-3 border border-destructive/40 bg-destructive/[0.07] px-3 py-2 font-mono text-xs text-destructive">
-              {error}
-            </p>
+              {error && (
+                <p className="mt-3 border border-destructive/40 bg-destructive/[0.07] px-3 py-2 font-mono text-xs text-destructive">
+                  {error}
+                </p>
+              )}
+
+              <Button
+                onClick={() => void submit()}
+                disabled={busy}
+                className="mt-6 h-12 gap-2 border border-primary/40 bg-primary/10 font-mono text-sm tracking-wide text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-40 sm:h-11 sm:text-[13px]"
+              >
+                {busy && <LoaderCircle className="size-3.5 animate-spin" />}
+                <span className="truncate">
+                  {isLogin ? "sign_in()" : "create_account()"}
+                </span>
+              </Button>
+
+              {/* Forgot password — sign-in only. */}
+              {isLogin && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("forgot");
+                    setError(null);
+                    setNotice(null);
+                  }}
+                  className="mt-3 self-center font-mono text-xs text-muted-foreground/70 underline decoration-border/60 underline-offset-4 transition-colors hover:text-primary"
+                >
+                  forgot password?
+                </button>
+              )}
+            </>
+          ) : mode === "forgot" ? (
+            <ForgotForm
+              email={email}
+              setEmail={setEmail}
+              busy={busy}
+              error={error}
+              notice={notice}
+              devLink={devLink}
+              onSubmit={() => void submitForgot()}
+              onBack={backToSignIn}
+            />
+          ) : (
+            <ResetForm
+              password={password}
+              setPassword={setPassword}
+              showPassword={showPassword}
+              setShowPassword={setShowPassword}
+              busy={busy}
+              error={error}
+              onSubmit={() => void submitReset()}
+              onBack={backToSignIn}
+            />
           )}
 
-          <Button
-            onClick={() => void submit()}
-            disabled={busy}
-            className="mt-6 h-12 gap-2 border border-primary/40 bg-primary/10 font-mono text-sm tracking-wide text-primary hover:bg-primary hover:text-primary-foreground disabled:opacity-40 sm:h-11 sm:text-[13px]"
-          >
-            {busy && <LoaderCircle className="size-3.5 animate-spin" />}
-            <span className="truncate">
-              {isLogin ? "sign_in()" : "create_account()"}
-            </span>
-          </Button>
-
           <p className="text-data-sm mt-8 text-center text-muted-foreground/50">
-            an account is required to use Thrace — your data stays yours
+            {mode === "signin"
+              ? "an account is required to use Thrace — your data stays yours"
+              : "a reset link expires in 1 hour"}
           </p>
 
           {onBack && (

@@ -251,6 +251,34 @@ def api_me(user: dict | None = Depends(auth.resolve_user)):
     return {"user": user}
 
 
+# --- Password reset ---------------------------------------------------------
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str
+
+
+@app.post("/api/auth/forgot-password")
+def api_forgot_password(req: ForgotPasswordRequest):
+    """Start a password reset.
+
+    The response is deliberately identical for known and unknown addresses, so
+    it cannot be used to discover which emails have accounts. `dev_token` is
+    present only when no SMTP server is configured, so the flow is demonstrable
+    without a mail server.
+    """
+    return auth.request_password_reset(req.email)
+
+
+@app.post("/api/auth/reset-password")
+def api_reset_password(req: ResetPasswordRequest):
+    """Complete a reset with a single-use token from the reset link."""
+    return auth.reset_password(req.token, req.password)
+
+
 # --- Google OAuth -----------------------------------------------------------
 @app.get("/api/auth/google/url")
 def google_auth_url(request: Request):
