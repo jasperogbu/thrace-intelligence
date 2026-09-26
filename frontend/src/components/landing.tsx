@@ -115,10 +115,6 @@ export function Landing({ onAnalyze }: LandingProps) {
               </Button>
             </div>
           </div>
-
-          <p className="text-data-sm mt-6 text-muted-foreground/50 sm:mt-8">
-            one analytical pass — fastest, with a few real sources attached
-          </p>
         </div>
       </main>
     </div>
