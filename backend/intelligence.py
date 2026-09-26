@@ -54,8 +54,39 @@ _TRANSIENT_MARKERS = (
     "temporarily unavailable",
 )
 
-STAGE_MAX_ATTEMPTS = int(os.getenv("STAGE_MAX_ATTEMPTS", "3"))
-STAGE_RETRY_DELAY = int(os.getenv("STAGE_RETRY_DELAY", "4"))
+# Retries exist for capacity blips, not for bad requests. One retry on a fresh
+# model absorbs the common "503 high demand" spike; more than that is a slow
+# failure the user is better served by seeing immediately. The previous default
+# of 3 attempts with a 4s multiplier meant the worst case waited 4s + 8s before
+# surfacing, on top of whatever the model layer had already spent.
+STAGE_MAX_ATTEMPTS = int(os.getenv("STAGE_MAX_ATTEMPTS", "2"))
+STAGE_RETRY_DELAY = int(os.getenv("STAGE_RETRY_DELAY", "2"))
+
+# Errors that will never resolve on a retry. Retrying these just delays the
+# error message the user needs to see: a bad key, a bad model id, a malformed
+# request or a refused one. Matched case-insensitively against the exception
+# text.
+_PERMANENT_MARKERS = (
+    "401",
+    "403",
+    "invalid_api_key",
+    "incorrect api key",
+    "unauthenticated",
+    "permission denied",
+    "model_not_found",
+    "not_found_error",
+    "invalid model",
+    "unsupported model",
+    "400",
+    "invalid_request_error",
+    "invalid argument",
+)
+
+
+def is_permanent_error(exc: Exception) -> bool:
+    """True when retrying cannot possibly help."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _PERMANENT_MARKERS)
 
 
 def is_transient_error(exc: Exception) -> bool:
@@ -106,6 +137,76 @@ def _agno_events():
     return RunContentEvent, RunErrorEvent
 
 
+def _error_text(failure: Exception) -> str:
+    """A readable message from an error event.
+
+    Agno sometimes puts a non-string object in `RunErrorEvent.content` (an
+    SDK response wrapper, for instance) rather than a message, and stringifying
+    that blindly leaks `<google.genai._api_client.HttpResponse object at
+    0x7f...>` to the user. Fall back to the type name so the message is at
+    least diagnostic.
+    """
+    content = getattr(failure, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, BaseException):
+        return f"{type(content).__name__}: {content}"
+    kind = getattr(failure, "error_type", None)
+    if kind:
+        return str(kind)
+    return type(failure).__name__
+
+
+# A response that stops mid-sentence was cut off by the output cap. The
+# distinction matters: a report that ends on a complete thought is concise,
+# one that ends on "the software will be" looks broken. These are the
+# characters a finished answer may legitimately end on.
+_SENTENCE_END = frozenset(".!?:;*`)]}\"'|")
+# A list item or label longer than this is prose, not a fragment, so it has to
+# end on real sentence punctuation like any other sentence.
+_LABEL_MAX_CHARS = 90
+_LAST_CHARS = 240
+
+
+def looks_truncated(text: str) -> bool:
+    """True when `text` appears to have been cut off mid-sentence.
+
+    Only a heuristic, and deliberately biased towards not firing. Markdown
+    reports legitimately end without sentence punctuation — on a bolded
+    fragment, a heading, a table pipe, a list dash, a blockquote or a code
+    fence — and treating those as truncation would cry wolf on almost every
+    report. So: a last line that is structural is never truncation, and only a
+    plain prose line has to end on real sentence punctuation.
+
+    Empty text is not truncation; that is the empty-report case, handled
+    separately by the caller.
+    """
+    tail = (text or "").rstrip()
+    if not tail:
+        return False
+
+    last_line = tail.rsplit("\n", 1)[-1].strip()
+    if not last_line:
+        return False
+
+    # Headings, table rows, quotes and fences genuinely end without sentence
+    # punctuation, so they are never truncation.
+    if last_line.startswith(("#", ">", "|", "```", "---", "***", "___")):
+        return False
+
+    # A list item or bolded label is only exempt when it is short. A short one
+    # ("- **Metric:** cost-per-ton") is a deliberate fragment; a long one that
+    # ends on a bare word ("* **For competitors:** do not compete on API docs,
+    # instead compete on superior enterprise-level") is a sentence the output
+    # cap cut in half, and calling that complete is the exact bug this guard
+    # exists to catch.
+    if last_line.startswith(("-", "*", "+")) or last_line.endswith(("**", "`")):
+        if len(last_line) <= _LABEL_MAX_CHARS:
+            return False
+
+    return last_line[-1] not in _SENTENCE_END
+
+
 def stream_agent(agent_factory: Callable[[], object], prompt: str) -> Iterator[dict]:
     """Stream one report from a no-tools agent, retrying transient failures.
 
@@ -127,14 +228,11 @@ def stream_agent(agent_factory: Callable[[], object], prompt: str) -> Iterator[d
                     emitted = True
                     yield {"type": "delta", "data": event.content}
             elif isinstance(event, run_error):
-                failure = RuntimeError(
-                    f"Report generation failed: "
-                    f"{event.content or event.error_type or 'unknown'}"
-                )
+                failure = RuntimeError(f"Report generation failed: {_error_text(event)}")
                 break
         if failure is None:
             return
-        if attempt < STAGE_MAX_ATTEMPTS and is_transient_error(failure):
+        if attempt < STAGE_MAX_ATTEMPTS and is_transient_error(failure) and not is_permanent_error(failure):
             if emitted:
                 yield {"type": "reset"}
                 emitted = False
@@ -154,8 +252,10 @@ def stream_agent(agent_factory: Callable[[], object], prompt: str) -> Iterator[d
 # Sources
 # ---------------------------------------------------------------------------
 # How many links we are willing to show. Kept small on purpose: a short list of
-# real sources is worth more than a long one nobody reads.
+# real sources is worth more than a long one nobody reads. The brief asks for
+# 3-5, so the curated floor is set to 4 and live search is capped to match.
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "5"))
+MIN_SOURCES = int(os.getenv("MIN_SOURCES", "3"))
 
 # Wall-clock budget for source retrieval. The report is already streaming by
 # the time this matters, so the only cost of a slow backend is a short pause
@@ -170,25 +270,97 @@ MAX_LIVE_QUERIES = int(os.getenv("MAX_SOURCE_QUERIES", "2"))
 # *floor*, not a substitute for live search: they are only offered when live
 # retrieval produced nothing, and only when the query actually touches their
 # subject. Every URL here is a real, long-standing organisation homepage.
+#
+# Scored rather than first-match, so a "fintech in Nigeria" query surfaces the
+# Nigerian central bank and the securities regulator alongside the IMF instead
+# of whichever entry happens to be listed first.
 _OFFICIAL_SOURCES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("World Bank", "https://www.worldbank.org",
      ("market", "economy", "gdp", "development", "poverty", "business",
-      "nigeria", "africa", "emerging", "smb", "sme", "startup", "funding")),
+      "nigeria", "africa", "emerging", "smb", "sme", "startup", "funding",
+      "infrastructure", "sme", "enterprise", "informal")),
+    ("World Bank Open Data", "https://data.worldbank.org",
+     ("data", "statistic", "indicator", "population", "inflation", "rate",
+      "measure", "benchmark")),
     ("FAO (UN Food & Agriculture)", "https://www.fao.org",
      ("agricultur", "farm", "food", "produce", "livestock", "crop", "rural",
-      "supply chain", "restaurant")),
-    ("World Bank Open Data", "https://data.worldbank.org",
-     ("data", "statistic", "indicator", "population", "inflation", "rate")),
+      "supply chain", "restaurant", "harvest", "irrigation", "cold chain")),
     ("UNIDO", "https://www.unido.org",
      ("manufactur", "factory", "industrial", "production", "value chain")),
     ("International Trade Centre", "https://www.intracen.org",
      ("export", "import", "trade", "tariff", "customs", "logistics")),
     ("WHO", "https://www.who.int",
-     ("health", "clinic", "medical", "hospital", "patient", "disease")),
+     ("health", "clinic", "medical", "hospital", "patient", "disease",
+      "pharmac", "diagnos")),
     ("ITU", "https://www.itu.int",
      ("digital", "internet", "broadband", "telecom", "connectivity", "mobile")),
     ("IMF", "https://www.imf.org",
-     ("finance", "fintech", "bank", "lending", "credit", "monetary", "currency")),
+     ("finance", "fintech", "bank", "lending", "credit", "monetary", "currency",
+      "inflation", "savings", "insurance")),
+    # Nigerian and regional regulators — the sources a local founder is
+    # actually obliged to deal with, and the ones a global list always misses.
+    ("Central Bank of Nigeria", "https://www.cbn.gov.ng",
+     ("fintech", "bank", "payment", "lending", "credit", "mobile money",
+      "monetary", "currency", "deposit", "naira", "pos", "transfer",
+      "financial", "insurance", "savings", "microfinance")),
+    ("Securities and Exchange Commission (Nigeria)", "https://www.sec.gov.ng",
+     ("securit", "invest", "capital market", "stock", "exchange", "fund",
+      "asset management", "fintech", "listing")),
+    ("CAC Nigeria (Corporate Affairs Commission)", "https://www.cac.gov.ng",
+     ("register", "registration", "company", "incorporat", "business name",
+      "entity", "licen", "startup", "entrepreneur")),
+    ("SMEDAN (Nigerian SME agency)", "https://www.smedan.gov.ng",
+     ("sme", "small business", "entrepreneur", "enterprise", "msme",
+      "incubator", "startup", "founder", "youth", "cooperative", "artisan")),
+    ("NITDA (Nigerian IT Development Agency)", "https://www.nitda.gov.ng",
+     ("software", "tech", "digital", "developer", "it ", "startup",
+      "innovation", "ict", "ai", "data")),
+    ("CBN Exchange", "https://www.cbn.gov.ng/finmarkets/exch",
+     ("forex", "exchange rate", "foreign", "remittance")),
+    ("African Development Bank", "https://www.afdb.org",
+     ("africa", "nigeria", "development", "finance", "infrastructure",
+      "project", "investment", "grant")),
+    ("WIPO (World Intellectual Property Organization)", "https://www.wipo.int",
+     ("patent", "trademark", "brand", "ip", "infring", "copyright")),
+    # General-purpose bodies that are relevant to almost any venture question.
+    # They exist so the relevance top-up can reach MIN_SOURCES without padding
+    # the list with something unrelated to the sector.
+    ("World Economic Forum", "https://www.weforum.org",
+     ("emerging", "trend", "future", "global", "disrupt", "opportunity",
+      "innovation", "market", "business")),
+    ("UNCTAD (UN Trade & Development)", "https://unctad.org",
+     ("trade", "developing", "sme", "investment", "market", "business",
+      "economy", "entrepreneur", "value chain")),
+    ("ILO (International Labour Organization)", "https://www.ilo.org",
+     ("job", "employment", "labour", "labor", "worker", "skill", "training",
+      "apprentice", "wage", "informal")),
+    ("UNEP", "https://www.unep.org",
+     ("climate", "environment", "sustainab", "solar", "energy", "green",
+      "carbon", "recycl", "waste", "emission")),
+    ("IEA (International Energy Agency)", "https://www.iea.org",
+     ("energy", "power", "electric", "solar", "fuel", "grid", "generator")),
+)
+
+# Ordered last-resort tier for the top-up: broad, cross-sector bodies that are
+# defensible for any venture question. Used only when sector scoring left the
+# list below MIN_SOURCES, and only after every keyword-matched source has been
+# used — so relevance always wins over completeness.
+_GENERAL_FILLERS: tuple[tuple[str, str], ...] = (
+    ("World Bank", "https://www.worldbank.org"),
+    ("UNCTAD (UN Trade & Development)", "https://unctad.org"),
+    ("World Economic Forum", "https://www.weforum.org"),
+    ("ILO (International Labour Organization)", "https://www.ilo.org"),
+    ("ITU", "https://www.itu.int"),
+    ("UNIDO", "https://www.unido.org"),
+    ("WIPO (World Intellectual Property Organization)", "https://www.wipo.int"),
+)
+
+# Sector terms that are strong enough to rank a source above a generic match.
+_STRONG_TERMS = frozenset(
+    ("fintech", "bank", "payment", "lending", "credit", "insurance", "savings",
+     "agricultur", "farm", "food", "health", "clinic", "medical", "energy",
+     "solar", "climate", "logistics", "manufactur", "export", "import",
+     "telecom", "software", "developer", "patent", "trademark", "crypto")
 )
 
 _URL_RE = re.compile(r"https?://[^\s\)\]\"'<>]+")
@@ -249,14 +421,44 @@ def _label_from(url: str) -> str:
         return url
 
 
-def _official_fallback(query: str) -> list[dict]:
-    """Curated official sources whose subject the query actually touches."""
-    low = (query or "").lower()
-    return [
-        {"label": label, "url": url}
-        for label, url, keywords in _OFFICIAL_SOURCES
-        if any(k in low for k in keywords)
-    ][:3]
+# When the query names the country, the local regulator is more useful than the
+# global institution. "fintech in Nigeria" should point at the CBN, not lead
+# with the IMF.
+_LOCALE_BOOST = 4
+_LOCALE_TERMS = ("nigeria", "nigerian", "lagos", "abuja", "kano", "ibadan",
+                 "port harcourt", "aba", "benin city", "kaduna", "enugu",
+                 "africa", "african", "west africa", "naira")
+# Local bodies, used to pick the top-up when a query has too few matches.
+_LOCAL_LABELS = ("cbn.gov.ng", "sec.gov.ng", "cac.gov.ng", "smedan.gov.ng",
+                 "nitda.gov.ng")
+
+
+def _official_fallback(query: str, limit: int = 4) -> list[dict]:
+    """Curated official sources ranked by how well they match the query.
+
+    Relevance is scored, not first-matched: a body whose keywords include a
+    term the query uses *strongly* (a sector word like "fintech") outranks one
+    that only matches a broad word like "market". A local regulator is boosted
+    when the query names its country, so "fintech in Nigeria" leads with the
+    Central Bank of Nigeria instead of the IMF.
+    """
+    low = f" {(query or '').lower()} "
+    local = any(term in low for term in _LOCALE_TERMS)
+    scored: list[tuple[int, int, str, str]] = []
+    for order, (label, url, keywords) in enumerate(_OFFICIAL_SOURCES):
+        score = 0
+        for kw in keywords:
+            if kw in low:
+                # Sector terms are worth more than catch-alls.
+                score += 3 if kw in _STRONG_TERMS else 1
+        if not score:
+            continue
+        if local and any(d in url for d in _LOCAL_LABELS):
+            score += _LOCALE_BOOST
+        scored.append((-score, order, label, url))
+
+    scored.sort()
+    return [{"label": label, "url": url} for _, _, label, url in scored[:limit]]
 
 
 def _live_search(query: str, limit: int) -> list[dict]:
@@ -323,8 +525,44 @@ class SourceCollector:
                 break
 
         if not found:
-            found = _official_fallback(self.query)
+            # Curated fallback, scored for relevance. `seen` is seeded from the
+            # first pass so the top-up below cannot re-add an entry (it scored
+            # against a different limit and returns the same prefix).
+            found = _official_fallback(self.query, limit=self.limit)
+            seen.update(src["url"] for src in found)
+            # Every remaining keyword-matched body, still in score order.
+            if len(found) < MIN_SOURCES:
+                for src in _official_fallback(
+                    self.query, limit=len(_OFFICIAL_SOURCES)
+                ):
+                    if len(found) >= MIN_SOURCES:
+                        break
+                    if src["url"] not in seen:
+                        seen.add(src["url"])
+                        found.append(src)
+            # Still thin (a narrow query like "crypto exchange" matches one
+            # body). Top up with broad cross-sector bodies so the report ends
+            # with a useful list rather than a one-line stub. Relevance always
+            # wins: these are only reached after every match has been used.
+            if len(found) < MIN_SOURCES:
+                for label, url in _GENERAL_FILLERS:
+                    if len(found) >= MIN_SOURCES:
+                        break
+                    if url not in seen:
+                        seen.add(url)
+                        found.append({"label": label, "url": url})
         self._sources = found[: self.limit]
+
+    def has_sources(self) -> bool:
+        """True once the collector is done and produced something.
+
+        The generic floor sources are added when live retrieval finds nothing
+        *and* the curated list would otherwise be too thin to be useful — a
+        one- or two-link Sources block reads as a bug, not as restraint. The
+        brief asks for 3-5 real links on every report, so we top up with
+        sector-generic official bodies rather than shipping a stub section.
+        """
+        return len(self._sources) >= MIN_SOURCES
 
     def results(self, budget: float = SOURCE_BUDGET_SECONDS) -> list[dict]:
         """Wait up to `budget` seconds for the thread, then take what we have."""
@@ -334,7 +572,13 @@ class SourceCollector:
 
 
 def render_sources(sources: list[dict]) -> str:
-    """Render the `## Sources` block, or '' when there is nothing real to show."""
+    """Render the `## Sources` block, or '' when there is nothing real to show.
+
+    Deliberately a plain markdown list, not an inline citation scheme: the
+    report never cites [1]/[2], and every link is a real URL that was either
+    returned by search or is a known official body. `markdown.tsx` already
+    renders these as clickable external links.
+    """
     if not sources:
         return ""
     lines = ["", "## Sources", ""]

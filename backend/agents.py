@@ -191,7 +191,84 @@ _quota_marks: dict[str, float] = {}  # model -> monotonic ts when usable again
 _rr_index = 0
 _last_request_ts = 0.0
 
+# Observed latency per model, as a running mean of successful calls.
+#
+# The pool used to be round-robin, which is why TTFT varied from 2s to 95s on
+# identical requests: the free tier serves some of these models far slower than
+# others (measured on a short prompt — gemini-3.1-flash-lite ~0.8s,
+# gemini-3.6-flash ~1.9s, gemini-3.5-flash ~28s, and gemini-3.8-flash spends
+# most of its time in 429/503). Round-robin sent a third of all requests to the
+# slow ones. Selection is now latency-aware: measured models are preferred in
+# ascending order of observed time, and an unmeasured model is assumed fast so
+# the pool still explores on first contact.
+_latency_ms: dict[str, float] = {}
+_LATENCY_SMOOTHING = 0.3  # weight of the newest sample
+# Assumed latency for a model we have never successfully called, in ms. Chosen
+# to sit between the fast and slow observed models so an unmeasured model is
+# tried early but not ahead of one we know is quick.
+_ASSUMED_LATENCY_MS = 6000.0
+
+# Lite-tier models stay in the pool as a fallback for when every full model is
+# benched, but they must not win on speed alone. Pure latency ranking put ~50%
+# of traffic on gemini-3.1-flash-lite, which is a real quality drop for
+# reports that depend on judgement. This penalty sorts any "-lite" model behind
+# every full model regardless of how fast it is, so quality is the default and
+# lite is the overflow.
+_LITE_PENALTY_MS = 120000.0
+
+# Geometric decay applied per rank when allocating traffic across the pool.
+# 0.15 puts ~85% of requests on the fastest model, ~13% on the second, and
+# under 2% on anything past the third.
+_RANK_DECAY = 0.15
+
+# Slow-model quarantine. A model whose time-to-first-token exceeds both of
+# these is not "a slower option" for an interactive product, it is broken: on
+# this tier gemini-3.5-flash measured ~28s to first token against ~0.8-2s for
+# its siblings. Ranking alone still hands it double-digit traffic whenever the
+# pool is small, so it is benched outright for a while and re-probed later.
+_SLOW_TTFT_SECONDS = float(os.getenv("SLOW_TTFT_SECONDS", "8"))
+_SLOW_QUARANTINE_SECONDS = float(os.getenv("SLOW_QUARANTINE_SECONDS", "300"))
+_SLOW_VS_FASTEST_RATIO = float(os.getenv("SLOW_VS_FASTEST_RATIO", "4"))
+
+
+def _rank_key(model: str) -> tuple[float, str]:
+    """Sort key for model selection: effective latency, then name."""
+    base = _latency_ms.get(model, _ASSUMED_LATENCY_MS)
+    if "lite" in model.lower():
+        base += _LITE_PENALTY_MS
+    return (base, model)
+
+
 _RETRY_DELAY_RE = re.compile(r"retry in ([0-9.]+)\s*s", re.IGNORECASE)
+
+
+def _record_latency(model: str, seconds: float) -> None:
+    """Fold one successful call's duration into the model's running mean.
+
+    A model that is pathologically slow to first token is quarantined here
+    rather than merely ranked last: ranking still routes double-digit traffic
+    to it whenever the pool is small, and one 28s request is a failed product.
+    """
+    with _rotation_lock:
+        sample = max(seconds, 0.0) * 1000.0
+        prior = _latency_ms.get(model)
+        _latency_ms[model] = sample if prior is None else (
+            _LATENCY_SMOOTHING * sample + (1 - _LATENCY_SMOOTHING) * prior
+        )
+        smoothed = _latency_ms[model] / 1000.0
+        others = [v / 1000.0 for m, v in _latency_ms.items() if m != model]
+        fastest = min(others) if others else None
+        if (
+            smoothed > _SLOW_TTFT_SECONDS
+            and fastest is not None
+            and smoothed > fastest * _SLOW_VS_FASTEST_RATIO
+        ):
+            _quota_marks[model] = time.monotonic() + _SLOW_QUARANTINE_SECONDS
+            print(
+                f"[thrace] {model} quarantined: {smoothed:.1f}s to first token "
+                f"vs {fastest:.1f}s best; benched {_SLOW_QUARANTINE_SECONDS:.0f}s",
+                flush=True,
+            )
 
 
 def _model_pool() -> list[str]:
@@ -211,12 +288,17 @@ def _model_pool() -> list[str]:
 
 
 def _next_model() -> str:
-    """Round-robin the next usable model.
+    """Pick the fastest usable model, rather than the next in rotation.
 
-    Skips models benched by a quota error. When every model is cooling down we
-    pause briefly and then return the model that frees up soonest, rather than
-    blocking until its full retry window expires — a run must never stall for a
-    minute because one model is throttled.
+    Skips models benched by a quota or capacity error, and among the rest
+    prefers the one with the lowest observed latency (see `_latency_ms`). This
+    replaces round-robin, which sent a third of requests to models the free
+    tier serves an order of magnitude slower.
+
+    When every model is cooling down we pause briefly and then return the model
+    that frees up soonest, rather than blocking until its full retry window
+    expires — a run must never stall for a minute because one model is
+    throttled.
     """
     global _rr_index
     with _rotation_lock:
@@ -227,7 +309,26 @@ def _next_model() -> str:
         usable = [m for m in pool if _quota_marks.get(m, 0.0) <= now]
         if usable:
             _rr_index += 1
-            return usable[_rr_index % len(usable)]
+            # Ascending latency, then weighted pick. Uniform rotation still sent
+            # a third of traffic to the slowest model, so slots are allocated
+            # by rank with a steep geometric decay: the fastest usable model
+            # takes ~75% of traffic, the next ~19%, then ~5%, ~1%, ~0.3%. The
+            # tail stays reachable so a recovered model is not starved, but it
+            # no longer costs the user 20s on one request in five.
+            ordered = sorted(usable, key=_rank_key)
+            if len(ordered) == 1:
+                return ordered[0]
+            weights = [_RANK_DECAY**rank for rank in range(len(ordered))]
+            total = sum(weights)
+            # Deterministic walk over the cumulative weights, so the
+            # distribution is exactly the intended one rather than sampled.
+            point = (_rr_index % 1000) / 1000.0 * total
+            upto = 0.0
+            for model, weight in zip(ordered, weights):
+                upto += weight
+                if point < upto:
+                    return model
+            return ordered[-1]
         soonest = min(pool, key=lambda m: _quota_marks.get(m, 0.0))
         wait = _quota_marks[soonest] - now
     capped = min(max(wait, 0.0), _MAX_COOLDOWN_WAIT)
@@ -314,12 +415,21 @@ def _pace_gemini_request() -> None:
 
 
 class _PacedGemini(Gemini):
-    """Gemini client that round-robins every request across the model pool.
+    """Gemini client that picks the fastest usable model for every request.
 
-    Each request picks the next usable model and is globally paced. Any
-    transient provider error rotates to another model and transparently
-    retries, so per-model limits and capacity spikes never surface to the
-    agent layer.
+    Each request selects the quickest model that is not currently benched (see
+    `_next_model`), and is globally paced. Any transient provider error rotates
+    to another model and transparently retries, so per-model limits and
+    capacity spikes never surface to the agent layer.
+
+    The SDK's own HTTP retry is left at its default on purpose. It does add
+    ~1/2/4/8s of backoff on a hard 503, but disabling it (via
+    `client._http_options`) changed the shape of the error Agno surfaces —
+    `RunErrorEvent.content` became a raw `HttpResponse` object instead of a
+    message, which would have leaked `<google.genai._api_client.HttpResponse
+    object at 0x...>` to the user. Measured TTFT on this tier is dominated by
+    which model is chosen, not by that backoff, and the selection logic below
+    already fixes that.
     """
 
     def invoke(self, *args, **kwargs):
@@ -327,8 +437,11 @@ class _PacedGemini(Gemini):
         for attempt in range(1, max_attempts + 1):
             self.id = _next_model()
             _pace_gemini_request()
+            started = time.monotonic()
             try:
-                return super().invoke(*args, **kwargs)
+                result = super().invoke(*args, **kwargs)
+                _record_latency(self.id, time.monotonic() - started)
+                return result
             except Exception as exc:  # noqa: BLE001
                 if _rotate_on(self.id, exc, attempt, max_attempts):
                     continue
@@ -339,10 +452,17 @@ class _PacedGemini(Gemini):
         for attempt in range(1, max_attempts + 1):
             self.id = _next_model()
             _pace_gemini_request()
+            started = time.monotonic()
             emitted = False
             try:
                 for chunk in super().invoke_stream(*args, **kwargs):
-                    emitted = True
+                    if not emitted:
+                        emitted = True
+                        # Record time-to-first-token, not total stream length:
+                        # that is the latency the user perceives, and a long
+                        # report from a fast model should not be penalised for
+                        # being long.
+                        _record_latency(self.id, time.monotonic() - started)
                     yield chunk
                 return
             except Exception as exc:  # noqa: BLE001
@@ -354,8 +474,34 @@ class _PacedGemini(Gemini):
                 raise
 
 
-def _chat_model():
-    """Build the LLM client.
+# Output ceiling per feature. Generation time scales with output length, so
+# this is the single biggest latency lever: the venture report went from ~14.2k
+# characters to ~3.7k, which is most of the speedup.
+#
+# The prompt also states a word budget, but a hard token cap is the only thing
+# that bounds a runaway completion — a model that ignores "be concise" will
+# otherwise stream until it exhausts its own limit.
+#
+# These ceilings are tuned to COMPLETE, not to truncate. Dense markdown
+# (tables and pipes) tokenises at roughly 4-6 characters per token on this
+# model, and an earlier 900-token venture cap cut the report off mid-sentence
+# in "Business Model" — which reads as a broken product, not a concise one.
+# `_ensure_complete` catches that case explicitly.
+_MAX_TOKENS = {
+    "venture": int(os.getenv("VENTURE_MAX_TOKENS", "1300")),
+    "xray": int(os.getenv("XRAY_MAX_TOKENS", "1000")),
+    "discover": int(os.getenv("DISCOVERY_MAX_TOKENS", "900")),
+    "qa": int(os.getenv("QA_MAX_TOKENS", "500")),
+}
+_DEFAULT_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1800"))
+
+
+def _max_tokens(kind: str) -> int:
+    return _MAX_TOKENS.get(kind, _DEFAULT_MAX_TOKENS)
+
+
+def _chat_model(kind: str = "venture"):
+    """Build the LLM client for one feature.
 
     Provider is auto-detected from the model id:
       - ids starting with "gemini" -> Google Gemini via the native SDK
@@ -365,12 +511,24 @@ def _chat_model():
           - LLM_MODEL     -> model id (default gpt-4o)
           - LLM_BASE_URL  -> custom endpoint (e.g. an agent router / gateway); omit
                              for the default OpenAI endpoint.
+
+    `kind` selects the output ceiling for the feature being generated.
     """
     api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    max_tokens = _max_tokens(kind)
     if MODEL.lower().startswith("gemini"):
         return _PacedGemini(
             id=MODEL,
             api_key=os.getenv("GEMINI_API_KEY") or api_key,
+            max_output_tokens=max_tokens,
+            # Gemini 3.x reasons before it answers. Measured on this tier,
+            # leaving thinking at the default added ~4-5s to time-to-first-token
+            # on a short prompt, which is a third of the whole budget for an
+            # x-ray. "low" keeps enough reasoning to stay accurate on the
+            # judgement calls these reports make while cutting the pre-answer
+            # overhead. Override with GEMINI_THINKING_LEVEL=high to restore the
+            # default for harder work.
+            thinking_level=os.getenv("GEMINI_THINKING_LEVEL", "low"),
             # Transient provider rate limits are retryable, but Agno's retries
             # multiply: with exponential backoff, retries=5/delay=8 sleeps
             # 8+16+32+64+128s on one flaky call. Quota errors are already
@@ -385,6 +543,7 @@ def _chat_model():
         id=MODEL,
         api_key=api_key,
         base_url=base_url,
+        max_tokens=max_tokens,
         # Transient provider 429s (e.g. free-tier TPM windows) are retryable;
         # Agno's `retries` defaults to 0, which disables backoff entirely.
         retries=_LLM_RETRIES,
@@ -575,7 +734,7 @@ def _monitor_agent() -> Agent:
             Keep it under 250 words. Cite source URLs inline and end with a
             'Sources:' section. If nothing material changed, say so plainly.
         """),
-        model=_chat_model(),
+        model=_chat_model("qa"),
         tools=[TOOLS()],
         markdown=True,
         exponential_backoff=True,
@@ -634,7 +793,7 @@ def _discovery_agent() -> Agent:
         _DISCOVERY_AGENT_CACHE = Agent(
             name="Opportunity Discovery Analyst",
             description=_DISCOVERY_RULES,
-            model=_chat_model(),
+            model=_chat_model("discover"),
             markdown=True,
         )
     return _DISCOVERY_AGENT_CACHE
@@ -651,7 +810,7 @@ def _qa_agent() -> Agent:
             (under 200 words), grounded, and reference the report's sections or
             figures when useful.
         """),
-        model=_chat_model(),
+        model=_chat_model("qa"),
         markdown=True,
     )
 
@@ -665,7 +824,7 @@ def _digest_agent() -> Agent:
             a one-line overview, then per item: the subject, what changed and the
             recommended action. No new research — only what the briefs state.
         """),
-        model=_chat_model(),
+        model=_chat_model("qa"),
         markdown=True,
     )
 
@@ -721,86 +880,125 @@ def _digest_agent() -> Agent:
 # no sources at all — `intelligence.SourceCollector` gathers real URLs on a
 # background thread while the report streams, and appends them at the end. The
 # model still never writes a URL; we supply the real ones.
-_instant_agent_cache: Agent | None = None
+#
+# One agent per feature kind rather than one shared agent: each kind carries its
+# own output ceiling, and caching by kind is what lets a venture request and an
+# x-ray request use different budgets without rebuilding the client per call.
+_instant_agent_cache: dict[str, Agent] = {}
 
 
-def _instant_agent() -> Agent:
-    global _instant_agent_cache
-    if _instant_agent_cache is None:
-        _instant_agent_cache = Agent(
+def _instant_agent(kind: str = "venture") -> Agent:
+    cached = _instant_agent_cache.get(kind)
+    if cached is None:
+        cached = Agent(
             name="Thrace Intelligence Analyst",
             description=intelligence.FAST_ANALYST_RULES,
-            model=_chat_model(),
+            model=_chat_model(kind),
             markdown=True,
         )
-    return _instant_agent_cache
+        _instant_agent_cache[kind] = cached
+    return cached
 
 
 
 
 def instant_venture_prompt(idea: str) -> str:
+    """Concise Venture Intelligence report.
+
+    Section list is fixed; section *depth* is not. The old format asked for a
+    TAM/SAM/SOM table, a SWOT, a risk register, a startup-cost table, a
+    two-horizon roadmap, a regulatory checklist and KPIs — which reliably
+    produced ~14k characters and ~55s of generation for a first read.
+
+    The user can ask for depth in a follow-up question, so the first pass
+    optimises for decision speed: one tight section per question a founder
+    actually asks, hard length ceilings, and no section that restates another.
+    """
     return dedent(f"""
-        Write the complete Venture Intelligence Report for this business idea now,
-        in one pass, from your own analysis.
+        Write a Venture Intelligence report on this idea, in one pass.
 
         Idea: "{idea}"
 
-        === FORMAT SPECIFICATION ===
-        # Venture Intelligence Report — {idea}
-        ## Executive Verdict
-        One bold line: verdict (PURSUE / PIVOT / DROP), probability-of-success
-        percentage and its band, then <=80 words of reasoning.
-        ## 1. Idea Validation
-        Problem evidence, demand signals and a validation verdict (concise bullets).
-        ## 2. Market & Location Intelligence
-        TAM/SAM/SOM table, customer segments, local context, pricing tolerance.
-        ## 3. Competitive Landscape
-        Competitor table (name | offering | pricing | strength | gap), then the
-        white space a new entrant could take.
-        ## 4. Risk & Success Assessment
-        Scoring table, SWOT, risk register (risk | likelihood | impact | mitigation).
-        ## 5. Venture Plan & Roadmap
-        Business model, startup costs table, funding options, go-to-market,
-        0-90-day and 3-12-month roadmap, regulatory checklist, KPIs.
-        ## Basis
-        Two or three lines naming the assumptions this analysis rests on and what
-        must be verified before acting on it.
+        === STRUCTURE (use these headings, in this order) ===
+        # Venture Intelligence — {idea}
+        ## Executive Summary
+        Verdict (PURSUE / PIVOT / DROP) + 3 bullets. Max 90 words total.
+        ## Opportunity
+        The problem and who has it. 2-3 bullets.
+        ## Target Customers
+        2-3 bullets. Name the specific buyer, not a demographic sketch.
+        ## Market
+        One short paragraph + a 3-row table (TAM / SAM / SOM). Label every
+        figure "estimate" and state the assumption in one clause.
+        ## Competition
+        A 3-4 row table: incumbent | what they charge | the gap you exploit.
+        ## Business Model
+        How money is made, price point, and the one metric that decides
+        whether this works. 2-3 bullets.
+        ## Key Risks
+        3-4 bullets, each one line: risk, then its mitigation.
+        ## Validation Plan
+        3-4 bullets, ordered cheapest-first. Each names a concrete test, its
+        cost and what result would falsify the idea.
+        ## Recommended Next Steps
+        3 bullets, actionable this week.
+
+        === RULES ===
+        - Target 900-1300 words TOTAL. Hard ceiling 1500.
+        - Bullets over paragraphs. Tables only where a table is the clearer form.
+        - Never repeat a point in two sections.
+        - No preamble, no "in this report I will", no closing summary — the
+          sections are the whole report.
+        - Do not write a Sources section; sources are attached separately.
     """)
 
 
 def instant_xray_prompt(analysis_type: str, company: str) -> str:
+    """Concise Company X-Ray report.
+
+    Same length discipline as the venture report: the first pass answers
+    "should I care about this company and why", and the user drills into any
+    section with a follow-up question.
+    """
     if analysis_type == "sentiment":
         body = dedent("""
-            ### Positive Sentiment
-            - up to 6 bullets
-            ### Negative Sentiment
-            - up to 6 bullets
-            ### Overall Summary
-            <=120 words on the balance and what drives it.
+            ## Positive Signals
+            3-4 bullets.
+            ## Negative Signals
+            3-4 bullets.
+            ## Balance
+            Max 70 words: what drives the net read, and what would flip it.
         """)
     elif analysis_type == "metrics":
         body = dedent("""
-            ## Key Performance Indicators
-            | Metric | Value / Detail | Confidence |
-            |---|---|---|   (one row per KPI)
+            ## Key Metrics
+            A table: metric | value | confidence. 5-7 rows. Use "not public"
+            rather than inventing a number, and mark any estimate.
             ## Qualitative Signals
-            - up to 5 bullets
-            ## Summary & Implications
-            <=120 words on what the numbers imply and what to watch next.
+            3-4 bullets.
+            ## What To Watch
+            2-3 bullets.
         """)
     else:
         body = dedent(f"""
-            # {company} — Launch Review
-            ## 1. Market & Product Positioning
-            - up to 6 bullets on how {company} is positioned
-            ## 2. Launch Strengths
-            | Strength | Rationale |
-            |---|---|   (4-6 rows)
-            ## 3. Launch Weaknesses
-            | Weakness | Rationale |
-            |---|---|   (4-6 rows)
-            ## 4. Strategic Takeaways for Competitors
-            1. up to 5 numbered points
+            # {company} — Company X-Ray
+            ## Company Overview
+            2-3 bullets: what it is, who runs it, stage/scale.
+            ## Product & Target Market
+            2-3 bullets: what it sells and to whom.
+            ## Business Model
+            2 bullets: how it makes money, and pricing if known.
+            ## Competitive Position
+            2-3 bullets against its closest alternatives.
+            ## Strengths
+            3 bullets, one line each.
+            ## Weaknesses & Risks
+            3 bullets, one line each.
+            ## Opportunities
+            2-3 bullets: the most credible growth opening.
+            ## Key Takeaways
+            3 bullets: what a competitor or investor should actually do with
+            this.
         """)
     # A URL is a strong hint about which company is meant, and its domain
     # often reveals the sector. Use it as context; do not fetch it.
@@ -813,15 +1011,25 @@ def instant_xray_prompt(analysis_type: str, company: str) -> str:
             site, and do not invent page content, pricing or features.
         """)
     return dedent(f"""
-        Write the complete {analysis_type} report on {company} now, in one pass,
-        from your own analysis.
+        Write a concise {analysis_type} report on {company}, in one pass.
         {context}
-        === FORMAT SPECIFICATION ===
+        === STRUCTURE (use these headings) ===
         {body}
+
+        === RULES ===
+        - Target 500-800 words TOTAL. Hard ceiling 1000.
+        - Bullets, one line each where possible. No long paragraphs.
+        - Never repeat a point across sections.
+        - No preamble and no closing summary.
+        - If you are not confident about a company or a fact, say so in one
+          clause and move on. Do not invent customers, funding or products.
+        - Do not write a Sources section; sources are attached separately.
     """)
 
 
-def _stream_instant(prompt: str, sources_query: str = "") -> Iterator[dict]:
+def _stream_instant(
+    prompt: str, sources_query: str = "", kind: str = "venture"
+) -> Iterator[dict]:
     """Stream a knowledge-based report, then append real sources if any arrive.
 
     Sources are gathered on a background thread that starts *before* the report
@@ -829,14 +1037,23 @@ def _stream_instant(prompt: str, sources_query: str = "") -> Iterator[dict]:
     The bounded wait in `results()` is the only place a slow search backend can
     cost the user time, and it is a fixed ceiling rather than an open-ended
     crawl. If retrieval fails, the report simply ends without a Sources block.
+
+    The output cap keeps generation fast but can cut a report off mid-sentence.
+    We do not try to patch that with a second call: the client has no way to
+    replace the tail of a report it has already streamed, so a continuation
+    would be appended after the dangling clause and read as garbled text.
+    Instead the cap is set high enough to complete (see `_MAX_TOKENS`) and a
+    truncation is logged so it stays visible rather than silent.
     """
     collector = (
         intelligence.SourceCollector(sources_query).start() if sources_query else None
     )
     produced = False
-    for event in intelligence.stream_agent(_instant_agent, prompt):
+    body = ""
+    for event in intelligence.stream_agent(lambda: _instant_agent(kind), prompt):
         if event.get("type") == "delta" and event.get("data"):
             produced = True
+            body += event["data"]
         yield event
     if not produced:
         # A run that completes without emitting a single token is a provider
@@ -846,6 +1063,13 @@ def _stream_instant(prompt: str, sources_query: str = "") -> Iterator[dict]:
         raise RuntimeError(
             "The report came back empty. Please try again — this is usually a "
             "transient provider issue."
+        )
+    if intelligence.looks_truncated(body):
+        print(
+            f"[thrace] {kind} report hit the {_max_tokens(kind)}-token cap and "
+            f"ends mid-sentence ({len(body)} chars); raise "
+            f"{kind.upper()}_MAX_TOKENS if this recurs",
+            flush=True,
         )
     if collector is not None:
         block = intelligence.render_sources(collector.results())
@@ -865,7 +1089,9 @@ def run_instant_venture(idea: str) -> Iterator[dict]:
         "detail": "Reasoning over the idea and drafting the report…",
     }
     yield {"type": "stage_start", "stage": "report", "label": "Report"}
-    yield from _stream_instant(instant_venture_prompt(idea), sources_query=idea)
+    yield from _stream_instant(
+        instant_venture_prompt(idea), sources_query=idea, kind="venture"
+    )
     print(
         f"[thrace] venture report in {time.monotonic() - started:.1f}s",
         flush=True,
@@ -888,7 +1114,9 @@ def run_instant_xray(analysis_type: str, company: str) -> Iterator[dict]:
     # context (it is a strong hint about which company is meant) but we do not
     # crawl it — that is the deep-research behaviour this path replaces.
     yield from _stream_instant(
-        instant_xray_prompt(analysis_type, company), sources_query=company
+        instant_xray_prompt(analysis_type, company),
+        sources_query=company,
+        kind="xray",
     )
     print(
         f"[thrace] {analysis_type} report for {company} "
@@ -981,7 +1209,7 @@ def run_discovery(focus: str) -> Iterator[dict]:
                         yield {"type": "idea", **idea}
             elif isinstance(event, AgentRunErrorEvent):
                 raise RuntimeError(
-                    f"Discovery failed: {event.content or event.error_type or 'unknown'}"
+                    f"Discovery failed: {intelligence._error_text(event)}"
                 )
     except Exception as exc:  # noqa: BLE001
         # Fall back to one non-streaming attempt before giving up, so a flaky
@@ -1095,7 +1323,7 @@ def answer_question(report: str, question: str, subject: str = "") -> Iterator[d
                 yield {"type": "delta", "data": event.content}
         elif isinstance(event, AgentRunErrorEvent):
             failure = RuntimeError(
-                f"Report Q&A failed: {event.content or event.error_type or 'unknown'}"
+                f"Report Q&A failed: {intelligence._error_text(event)}"
             )
     if failure is not None and not emitted:
         raise failure
