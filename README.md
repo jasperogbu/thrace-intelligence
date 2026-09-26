@@ -5,7 +5,7 @@ Describe a business idea — e.g. *"AI-powered marketplace for Nigerian
 farmers"* — and Thrace returns a structured, decision-ready report in
 seconds: an executive verdict, the opportunity, target customers, market
 sizing, competition, business model, key risks, a validation plan, and
-recommended next steps, with a short list of real source links at the end.
+recommended next steps, followed by a short list of real source links.
 
 Three capabilities share one intelligence layer:
 
@@ -13,28 +13,25 @@ Three capabilities share one intelligence layer:
 - **Company X-Ray** — analyse an existing company
 - **Discovery** — generate business opportunities *worth validating*
 
-**User accounts** — sign in (email + password, bcrypt-hashed, JWT sessions) or
-continue with Google, to sync chats and the watchlist across devices;
+**User accounts** — sign in with email and password (bcrypt-hashed, JWT
+sessions) or Google, to sync chats and the watchlist across devices;
 anonymous guests keep a local session in the browser.
 
 ---
 
 ## Design principle
 
-> **Fast intelligence first. Deep research is optional, not the default.**
+> **Fast intelligence first.**
 
-Thrace reasons from the model's own knowledge first and answers immediately.
-Source retrieval is lightweight and runs in the background: it never blocks the
-report, and if it fails the report still streams. There is no deep crawling, no
-sequential multi-agent pipeline, and no fabricated URLs.
+Thrace reasons from the model's own knowledge and answers immediately, in
+one streaming call per request. Source retrieval is lightweight, runs on a
+background thread, and never blocks the report. There is no web crawling, no
+agent orchestration on the request path, and no fabricated URLs.
 
-This is a deliberate reversal of an earlier design. The original architecture
-ran five specialised agents with web tools across several waves, then a
-synthesis pass. It was thorough, and it was unusable: on a free-tier model pool
-a single report took the better part of a minute, and Discovery — which ran up
-to four web searches per request — was the slowest thing in the product. The
-current architecture replaces all of that with a single streaming model call
-per request.
+The system has **no tools on the request path**. The analyst cannot search
+or browse, so report generation is a function of the model alone and of
+output length alone. This is what makes the latency predictable and the
+failure modes small.
 
 ---
 
@@ -42,27 +39,29 @@ per request.
 
 ```
 frontend/   React 19 + TypeScript + Vite + Tailwind CSS v4 + shadcn/ui
-backend/    FastAPI + a single fast intelligence agent (Gemini)
+backend/    FastAPI + one streaming analyst per request (Agno + Gemini)
             + background source collection + SQLite + scheduler thread
+scripts/    Latency benchmark, regression suites, report renderer
 start.sh    One-command launcher (backend + frontend)
 stop.sh     Stop both servers
 ```
 
 ### One request, one call
 
-Every interactive feature follows the same path:
-
 ```
 POST /api/venture | /api/analyze | /api/discover
         ↓
-  intelligence.stream_agent()          # one streaming model call, no tools
+  intelligence.stream_agent()          # one streaming call, no tools
         ↓
-  deltas → existing UI renders Markdown progressively
+  delta events → existing UI renders Markdown progressively
         ↓
   SourceCollector (background thread)   # started BEFORE generation
         ↓
   3–5 real source links appended to the finished report
 ```
+
+The two independent branches are what make the report fast: generation never
+waits on retrieval, and retrieval never waits on generation.
 
 ### Venture Intelligence
 
@@ -81,90 +80,100 @@ A single analyst writes a structured report in one pass:
 | Recommended Next Steps | 3 actionable items |
 | Sources | 3–5 real, clickable links |
 
-Reports target 900–1300 words and are capped at 1300 output tokens. The user
-can go deeper on any section with a follow-up question.
+Reports target 900–1300 words and are capped at 1300 output tokens. Any
+section can be taken deeper with a follow-up question.
 
 ### Company X-Ray
 
-The same analyst, a different structure. For `competitor` analyses: company
+The same analyst, a different structure. For `competitor`: company
 overview, product and target market, business model, competitive position,
-strengths, weaknesses and risks, opportunities, key takeaways. `sentiment` and
-`metrics` variants structure the report around perception and KPIs
-respectively. Capped at 1000 output tokens.
+strengths, weaknesses and risks, opportunities, key takeaways. `sentiment`
+and `metrics` restructure the report around perception and KPIs. Capped at
+1000 output tokens.
 
-If the user supplies a URL instead of a company name, it is passed to the model
-as a hint about which company is meant. The site is **not** crawled.
+If the user supplies a URL instead of a company name it is passed to the
+model as a hint about which company is meant. The site is not fetched.
 
 ### Discovery
 
-A no-tools analyst proposes business opportunities from pretrained knowledge.
-Ideas are framed as **hypotheses worth validating**, never as validated
-findings. Each idea is emitted as soon as its block completes, so cards appear
-while the analyst is still writing, and any card can be sent straight into
-Venture Intelligence with one click.
+A no-tools analyst proposes business opportunities from pretrained
+knowledge, framed explicitly as **hypotheses worth validating**, never as
+validated findings. Each idea is emitted as soon as its block completes, so
+cards appear while the analyst is still writing, and any card launches
+directly into Venture Intelligence with one click. Capped at 900 tokens.
 
 ---
 
-## Intelligence layer
+## The intelligence layer
 
 `backend/intelligence.py` holds the strategy shared by all three features.
 
-**Analyst rules.** One system prompt, enforced for every feature: never
-fabricate sources, URLs, citations, statistics, companies, people or funding
-rounds; label estimates as estimates and state the assumption; hedge
-judgements; never imply that research was performed.
+**Analyst rules.** One system prompt enforces the honesty constraints for
+every feature: never fabricate sources, URLs, citations, statistics,
+companies, people or funding rounds; label estimates as estimates and state
+the assumption; hedge judgements rather than assert them; never imply that
+research was performed; answer directly without repetition.
 
-**Source integrity.** The model is *forbidden* from writing a URL. Real links
-are attached by the backend afterwards:
+**Source integrity.** The model is *forbidden* from writing a URL. Three
+mechanisms must all fail for a fabricated link to reach a user:
 
-1. **Live search** (when a search provider is configured) — most specific, first
-2. **Curated official bodies** scored against the query
-3. **Broad cross-sector bodies** to reach the floor of 3
+1. the system prompt forbids the model from writing one;
+2. the renderer is the only component that emits a link, and it accepts
+   only structured source objects — never free text from the model;
+3. every URL is either a real search result or a known official
+   organisation's root domain held in source code.
 
-Relevance is scored rather than first-matched, with a locale boost, so
-*"fintech in Nigeria"* leads with the Central Bank of Nigeria and the
-securities regulator rather than a global institution. The result is always
-3–5 deduplicated, real links.
+Sources are assembled in three tiers, each filling only what the tier above
+left short:
 
-Retrieval runs on a background thread started **before** generation, so by the
-time the report finishes there is usually something to show. A bounded wait
-follows, and any failure is swallowed — a dead search backend costs the user
-their sources, never their report.
+| Tier | Source | Role |
+|------|--------|------|
+| 1 | Live search results (`FIRECRAWL_API_KEY`) | Most specific, always first |
+| 2 | 21 curated official bodies, scored against the query | Sector and regulator relevance |
+| 3 | Broad cross-sector official bodies | Reaches the floor of three |
 
-> The curated fallback ships while no search provider has credits. Add
-> `FIRECRAWL_API_KEY` with credit and tier 1 fills with live results instead.
+Relevance is scored rather than first-matched: sector terms (*fintech*,
+*agricultur*, *health*) outrank catch-alls (*market*, *business*), and a
+local regulator is boosted when the query names its country. *"Fintech in
+Lagos"* therefore leads with the Central Bank of Nigeria and the securities
+regulator. The result is 3–5 deduplicated real links, capped at five.
 
 **Truncation guard.** The output cap is what makes generation fast, and a
-report cut off mid-sentence reads as a bug. Reports are checked for a
-truncation signature and the condition is logged rather than silently shipped.
+report cut off mid-sentence reads as a bug. Finished reports are checked for
+a truncation signature and the condition is logged rather than silently
+shipped. The detector is biased towards silence, since Markdown legitimately
+ends without sentence punctuation.
+
+**Error classification.** Transient failures (429, 503) are retried on a
+fresh model; permanent ones (401, 403, 400, unknown model) surface
+immediately, so the user never waits out a backoff that cannot help.
 
 ---
 
 ## Model layer
 
-Provider-flexible and tuned for latency. Model ids starting with `gemini` route
-through Google's native SDK (`GEMINI_API_KEY`); anything else goes through any
-OpenAI-compatible endpoint (`LLM_API_KEY` / `LLM_BASE_URL`).
+`backend/agents.py` owns the model client and the feature prompts. Model
+ids starting with `gemini` route through Google's native SDK
+(`GEMINI_API_KEY`); anything else goes through any OpenAI-compatible
+endpoint (`LLM_API_KEY` / `LLM_BASE_URL`).
 
-- **Latency-aware selection.** Every call records its time-to-first-token per
-  model, and traffic is weighted by observed speed rather than rotated
-  blindly. This matters more than it sounds: on the free tier the same API
-  served sibling flash models anywhere between 0.8s and 28s to first token, and
-  round-robin was sending a third of all requests to the slow one.
+- **Latency-aware selection.** Every call records its time-to-first-token
+  per model as a running mean, and traffic is weighted by observed speed
+  with a 0.15 decay per rank rather than rotated uniformly. This matters
+  more than it sounds: the same provider serves sibling flash models
+  anywhere between 0.8s and 28s to first token.
 - **Slow-model quarantine.** A model slower than 8s *and* 4× the fastest is
-  benched outright for five minutes and re-probed later.
+  benched for five minutes and re-probed later.
 - **Lite models rank last.** Speed alone must not buy a quality drop;
   lite-tier models are the overflow, not the default.
-- **Quota rotation.** A 429 benches that model for its reported retry window
-  and the request transparently retries on another. Errors never surface.
+- **Quota rotation.** A 429 benches that model for its reported retry
+  window and the request transparently retries on another.
 - **Global pacing.** `GEMINI_MIN_REQUEST_INTERVAL` spaces requests.
-- **Bounded retries.** Two attempts, 2s apart, and only for genuine transient
-  failures. Authentication errors, bad model ids and malformed requests are
-  never retried — the user sees the error immediately instead of waiting out
-  a backoff that cannot help.
-- **Per-feature output ceilings.** Venture 1300, X-ray 1000, Discovery 900,
-  Q&A 500 tokens. Dense markdown tokenises at roughly 4–6 characters per token,
-  so these are tuned to *complete*, not to truncate.
+- **Per-feature output ceilings.** Venture 1300, X-ray 1000, Discovery
+  900, Q&A 500 tokens. Dense markdown tokenises at roughly 4–6 characters
+  per token, so these are tuned to *complete*, not to truncate.
+- **Thinking level.** Gemini 3.x reasons before it answers; the level is
+  set to `low`, which removes several seconds of pre-answer latency.
 
 ---
 
@@ -173,19 +182,15 @@ OpenAI-compatible endpoint (`LLM_API_KEY` / `LLM_BASE_URL`).
 Recorded with `scripts/bench_intelligence.py`, which times each phase
 separately. Figures are from the Gemini free tier and vary with model load.
 
-| Feature | Time to first token | Total | Output |
-|---------|--------------------|-------|--------|
-| Venture Intelligence | 2–8s | 8–14s | ~5.5k chars |
-| Company X-Ray | 2–8s | 6–10s | ~4.5k chars |
-| Discovery | 2–6s | 5–10s | ~3.4k chars, 4 ideas |
+| Feature | Time to first token | Total | Output | Sources |
+|---------|--------------------|-------|--------|---------|
+| Venture Intelligence | 2–8s | 8–14s | ~5.5k chars | 3–5 |
+| Company X-Ray | 2–8s | 6–10s | ~4.5k chars | 3–5 |
+| Discovery | 2–6s | 5–10s | ~3.4k chars, 4 ideas | 3–5 |
 
-Before this pass the same features took 54.4s, 28.7s and 9.2s. Time-to-first-
-token ranged from 2s to 95s on identical requests because of the model
-selection problem described above.
-
-> The Gemini free tier allows 20 requests per day per model. Sustained
-> benchmarking exhausts it; failures during measurement are that quota, not the
-> application.
+> The Gemini free tier permits 20 requests per day per model. Sustained
+> benchmarking exhausts it; failures during measurement are that quota, not
+> the application.
 
 ---
 
@@ -195,14 +200,14 @@ selection problem described above.
 |------------|--------------|
 | **Streaming** | Every feature streams Server-Sent Events; the report renders as it is written |
 | **Source collection** | 3–5 real links appended to each report, retrieved in the background |
-| **Server-side persistence** | Completed exchanges sync to SQLite (`backend/data/`); chats remain conversational |
-| **Watchlist re-validation** | Watch any chat; a background scheduler re-runs a monitoring agent on a schedule and appends *what changed* |
+| **Server-side persistence** | Completed exchanges sync to SQLite; chats remain conversational across turns |
+| **Watchlist re-validation** | Watch any chat; a background scheduler re-runs the monitoring agent when due and appends *what changed* |
 | **In-app digest** | Monitoring updates aggregate into a daily Intelligence Digest; manual trigger in Settings |
 | **Opportunity discovery** | The Discover view proposes opportunities worth validating, each launchable into Venture Intelligence |
 | **Report Q&A** | Follow-up questions answered strictly from the chat's report — no new generation run |
 
-The frontend polls `/api/updates` and merges autonomous updates into the chat
-list automatically.
+The frontend polls `/api/updates` and merges autonomous updates into the
+chat list automatically.
 
 ## Requirements
 
@@ -214,11 +219,14 @@ list automatically.
   FIRECRAWL_API_KEY=fc-...  # optional — enables live source links
   # Optional: LLM_MODEL, LLM_FALLBACK_MODELS, LLM_API_KEY, LLM_BASE_URL
   # for the model pool or any OpenAI-compatible provider
+  # Optional: AUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+  # Optional: SMTP_HOST, SMTP_USER, SMTP_PASSWORD — password-reset email
+  # Optional: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN — hosted SQLite
   ```
 
-A model key is required. `FIRECRAWL_API_KEY` is **not** — source retrieval is
-optional by design, and a missing or out-of-credits key only costs the user
-their Sources block.
+A model key is required. `FIRECRAWL_API_KEY` is **not** — source retrieval
+is optional by design, and a missing or out-of-credits key only costs the
+user their Sources block.
 
 ## Quick Start
 
@@ -261,20 +269,23 @@ The launcher starts the API on `http://localhost:8000` and the app on
 | `/api/auth/register` | POST | Create an account → user + session token |
 | `/api/auth/login` | POST | Sign in → user + session token |
 | `/api/auth/me` | GET | Validate the session token → current user |
-| `/api/auth/google/url` | GET | Google consent-screen URL for popup sign-in |
+| `/api/auth/google/url` | GET | Google consent URL for popup sign-in |
+| `/api/auth/google/callback` | GET | Google redirect that posts the token back to the app |
+| `/api/auth/forgot-password` | POST | Start a password reset by emailed link |
+| `/api/auth/reset-password` | POST | Complete a reset with a single-use token |
 | `/api/venture` | POST | `{ idea }` → streamed Venture Intelligence report |
 | `/api/analyze` | POST | `{ company, analysis_type }` → streamed Company X-Ray report |
 | `/api/discover` | POST | `{ focus? }` → streamed opportunity ideas |
 | `/api/ask` | POST | `{ content, question }` → streamed answer grounded in the report |
-| `/api/runs/sync` | POST | Persist a completed chat exchange (user-scoped when authed) |
+| `/api/runs/sync` | POST | Persist a completed chat exchange |
 | `/api/chats` | GET | The signed-in user's full chat history |
 | `/api/chats/{id}` | DELETE | Delete a chat server-side |
 | `/api/chats/{id}/pin` | PATCH | Pin/unpin a chat server-side |
-| `/api/updates` | GET | Server-originated exchanges since a timestamp, for client polling |
+| `/api/updates` | GET | Server-originated exchanges since a timestamp |
 | `/api/watchlist` | GET/POST | List / add watched chats |
 | `/api/watchlist/{id}` | DELETE | Stop watching a chat |
 | `/api/digest/run` | POST | Manually trigger one scheduler cycle |
-| `/api/discover/scan` | GET/POST/DELETE | Persist, load or clear a discovery scan per user |
+| `/api/discover/scan` | GET/POST/DELETE | Load, persist or clear a discovery scan per user |
 
 ```bash
 # Venture Intelligence
@@ -312,13 +323,21 @@ curl -N -X POST http://localhost:8000/api/analyze \
 ```bash
 .venv/bin/python scripts/bench_intelligence.py          # latency phases
 .venv/bin/python scripts/bench_intelligence.py --repeat 3 --json
-.venv/bin/python scripts/test_xray_guard.py             # regression suite
-.venv/bin/python scripts/test_venture.py
+.venv/bin/python scripts/test_xray_guard.py             # regression suites
+.venv/bin/python scripts/test_venture.py                # live probe
 .venv/bin/python scripts/test_discovery_ideas.py
 .venv/bin/python scripts/test_quota_failfast.py
 ```
 
-## Future enhancements
+The four suites run against stubbed agents and consume no provider quota,
+except `test_venture.py`, which is a live probe against a running server.
 
-Not implemented. See `SCOPE_VENTURE_INTELLIGENCE.md` and Chapter Six of the
-project report for the full roadmap.
+### Project report
+
+The full academic write-up lives in `report/`, as Markdown chapters plus
+generated `.docx` and `.pdf`. Regenerate the binary formats after editing
+the chapters:
+
+```bash
+.venv/bin/python scripts/render_report.py
+```
