@@ -169,8 +169,8 @@ export function AuthView({ onAuthed, onBack }: AuthViewProps) {
         <div
           className={`mx-auto flex w-full max-w-sm flex-col justify-center px-5 py-10 sm:px-6 xl:mx-0 xl:max-w-none xl:flex-none xl:py-12 ${
             isLogin
-              ? "xl:order-2 xl:w-[26rem] xl:pl-8 xl:pr-20 2xl:pr-28"
-              : "xl:order-1 xl:w-[26rem] xl:pl-20 xl:pr-8 2xl:pl-28"
+              ? "xl:order-2 xl:w-[30rem] xl:pl-10 xl:pr-20 2xl:pr-28"
+              : "xl:order-1 xl:w-[30rem] xl:pl-20 xl:pr-10 2xl:pl-28"
           }`}
         >
           {/* Brand */}
