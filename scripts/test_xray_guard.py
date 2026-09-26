@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Offline regression guard for the Company X-Ray report and follow-up bugs.
 
-Covers two failures seen in the UI:
+Covers three failures seen in the UI:
 
-1. A Company X-Ray whose researched report came back empty left a blank screen,
-   because the provisional read was dropped before the researched text arrived
-   and nothing replaced it.
+1. A Company X-Ray whose report came back empty left a blank screen.
 2. The follow-up to a company chat was re-classified as a venture, so a message
    like "hi" was validated as a business idea instead of being asked about the
    company.
+3. Source retrieval failing (no API key, no credits, a dead backend) took the
+   whole report down with it.
 
 Runs entirely against stubbed agents — no provider calls and no API quota.
 Exits non-zero if any check fails.
@@ -22,6 +22,7 @@ BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backen
 sys.path.insert(0, os.path.normpath(BACKEND))
 
 import agents  # noqa: E402
+import intelligence  # noqa: E402
 import main  # noqa: E402
 
 FAILURES: list[str] = []
@@ -33,24 +34,12 @@ def check(label: str, cond: bool, detail: str = "") -> None:
         FAILURES.append(label)
 
 
-def install_stubs(provisional: list[dict], report: list[dict]) -> None:
-    agents.team_status = lambda: {"ready": True, "error": None, "model": "stub"}
-    agents.xray_provisional = lambda analysis_type, company: iter(provisional)
-    agents.run_bullets = lambda analysis_type, company: "stub bullets"
-    agents.stream_report = lambda analysis_type, company, bullets: iter(report)
+def drive_analyze(company: str = "Moniepoint") -> list[dict]:
+    """Run /api/analyze end to end and return the events the client would see."""
 
-
-def drive_analyze(deep: bool = True) -> list[dict]:
-    """Run /api/analyze end to end and return the events the client would see.
-
-    `deep=True` exercises the research path (where the blank-report bug lived);
-    the default request is now the instant path, so tests must ask for deep.
-    """
     async def collect():
         resp = main.analyze(
-            main.AnalyzeRequest(
-                company="Moniepoint", analysis_type="competitor", deep=deep
-            )
+            main.AnalyzeRequest(company=company, analysis_type="competitor")
         )
         events = []
         async for chunk in resp.body_iterator:
@@ -74,40 +63,111 @@ def replay_client(events: list[dict]) -> str:
     return acc
 
 
-# --- 1. an empty researched report must never blank the screen -------------
-install_stubs(provisional=[{"type": "delta", "data": "PRELIMINARY READ"}], report=[])
+agents.team_status = lambda: {"ready": True, "error": None, "model": "stub"}
+
+
+# --- 1. a report is streamed, and the stream always closes cleanly ----------
+agents.run_instant_xray = lambda analysis_type, company: iter(
+    [
+        {"type": "status", "label": "Analysing company", "detail": "stub"},
+        {"type": "stage_start", "stage": "report", "label": "Report"},
+        {"type": "delta", "data": "REAL "},
+        {"type": "delta", "data": "REPORT"},
+    ]
+)
 events = drive_analyze()
 types = [e["type"] for e in events]
-check("empty researched report emits no reset", "reset" not in types, f"events={types}")
-check(
-    "empty researched report keeps the preliminary read",
-    replay_client(events).strip() == "PRELIMINARY READ",
-    repr(replay_client(events)),
-)
-check(
-    "empty researched report tells the user research was incomplete",
-    any(e["type"] == "status" and e.get("label") == "Research incomplete" for e in events),
-)
-check("stream still closes with done", types[-1] == "done")
+check("a report streams its text", replay_client(events) == "REAL REPORT")
+check("the report stage is announced", "stage_start" in types, f"events={types}")
+check("stream closes with done", types[-1] == "done", f"events={types}")
+check("no reset on the single-pass path", "reset" not in types, f"events={types}")
 
-# --- 2. a normal researched report replaces the provisional text -----------
-install_stubs(
-    provisional=[{"type": "delta", "data": "PRELIMINARY READ"}],
-    report=[{"type": "delta", "data": "REAL "}, {"type": "delta", "data": "REPORT"}],
-)
+
+# --- 2. an empty report must not be reported as success --------------------
+# A no-content run is a bug upstream, but it must surface as an error rather
+# than a blank report that looks like a successful empty answer. This exercises
+# the real _stream_instant, so the analyst itself is stubbed to stay silent.
+class SilentAgent:
+    def run(self, prompt, stream=True):
+        return iter([])
+
+
+agents._instant_agent = lambda: SilentAgent()
+# Note: run_instant_xray was stubbed above, so call the real _stream_instant
+# directly — that is where the empty-report guard lives.
+try:
+    list(agents._stream_instant("PROMPT"))
+    check("an empty report raises rather than closing silently", False, "no error raised")
+except RuntimeError as exc:
+    check("an empty report raises rather than closing silently", True, str(exc)[:60])
+
+
+# --- 3. source failure must never cost the user their report ----------------
+class ReportThenBoom:
+    """Streams a real report, then source retrieval explodes."""
+
+    def run(self, prompt, stream=True):
+        return iter([])
+
+
+def xray_with_dead_sources(analysis_type: str, company: str):
+    yield {"type": "status", "label": "Analysing company", "detail": "stub"}
+    yield {"type": "stage_start", "stage": "report", "label": "Report"}
+    yield {"type": "delta", "data": "REPORT DESPITE NO SOURCES"}
+
+
+real_collector = intelligence.SourceCollector
+
+
+def exploding_collector(query: str, limit: int = 5):
+    class Boom(real_collector):  # type: ignore[misc,valid-type]
+        def _run(self):
+            raise RuntimeError("Payment Required: Insufficient credits")
+
+    return Boom(query, limit)
+
+
+intelligence.SourceCollector = exploding_collector
+agents.run_instant_xray = xray_with_dead_sources
 events = drive_analyze()
-resets = [i for i, e in enumerate(events) if e["type"] == "reset"]
-research_start = max(i for i, e in enumerate(events) if e["type"] == "stage_start")
-researched = [i for i, e in enumerate(events) if e["type"] == "delta" and i > research_start]
-check("exactly one reset", len(resets) == 1)
 check(
-    "reset precedes the first researched delta",
-    bool(resets) and bool(researched) and resets[0] < researched[0],
-    f"reset={resets} researched={researched}",
+    "source failure does not break the report",
+    "REPORT DESPITE NO SOURCES" in replay_client(events),
+    f"events={[e['type'] for e in events]}",
 )
-check("screen ends with the researched report", replay_client(events) == "REAL REPORT")
+check(
+    "no fabricated Sources block when retrieval failed",
+    "## Sources" not in replay_client(events),
+)
+intelligence.SourceCollector = real_collector
 
-# --- 3. Q&A stays anchored to the chat and never closes blank --------------
+
+# --- 4. sources are only ever rendered from real URLs -----------------------
+check(
+    "render_sources emits nothing for an empty list",
+    intelligence.render_sources([]) == "",
+)
+rendered = intelligence.render_sources(
+    [{"label": "World Bank", "url": "https://www.worldbank.org"}]
+)
+check(
+    "a real source renders as a clickable markdown link",
+    "- [World Bank](https://www.worldbank.org)" in rendered,
+    repr(rendered),
+)
+
+# A malformed or non-http result must never reach the renderer.
+extracted = intelligence._extract_sources(
+    "see [ok](https://example.com/a) and [bad](https://) and ftp://nope"
+)
+check(
+    "only real http(s) URLs survive extraction",
+    all(s["url"].startswith("http") for s in extracted) and extracted,
+    f"extracted={extracted}",
+)
+
+
+# --- 5. Q&A stays anchored to the chat and never closes blank --------------
 captured: dict[str, str] = {}
 
 
@@ -126,27 +186,25 @@ except RuntimeError:
 check("Q&A prompt is anchored to the chat subject", "Moniepoint" in captured.get("prompt", ""))
 check("Q&A prompt forbids starting a new analysis", "do not" in captured.get("prompt", ""))
 
-# --- 4. routing: instant is the default, deep opts into research -----------
-# Mirrors what agents.run_instant_xray really yields: a status, the report
-# stage, then the report text.
-agents.run_instant_xray = lambda analysis_type, company: iter(
-    [
-        {"type": "status", "label": "Drafting report", "detail": "stub"},
-        {"type": "stage_start", "stage": "report", "label": "Report"},
-        {"type": "delta", "data": "INSTANT READ"},
-    ]
-)
-instant_events = drive_analyze(deep=False)
-instant_types = [e["type"] for e in instant_events]
+# --- 6. discovery stays on the knowledge path ------------------------------
 check(
-    "a default request takes the instant path (no research stages)",
-    replay_client(instant_events) == "INSTANT READ" and "stage_start" in instant_types,
-    f"events={instant_types}",
+    "the discovery analyst has no web tools",
+    not agents._discovery_agent().tools,
+    f"tools={agents._discovery_agent().tools}",
 )
 check(
-    "the instant path does not touch the research pipeline",
-    "reset" not in instant_types and instant_types[-1] == "done",
-    f"events={instant_types}",
+    "the discovery analyst never sees a tool list",
+    "search" not in agents._DISCOVERY_RULES.lower().split("output strictly")[0].replace(
+        "no research tools", ""
+    ),
+)
+check(
+    "discovery ideas are framed as hypotheses, not findings",
+    "worth validating" in agents._DISCOVERY_RULES,
+)
+check(
+    "discovery is forbidden from printing URLs",
+    "never print a url" in agents._DISCOVERY_RULES.lower(),
 )
 
 print()

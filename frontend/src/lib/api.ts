@@ -138,27 +138,25 @@ async function postStream(
   await readSse(res, onEvent)
 }
 
-/** Run the Venture Intelligence pipeline for a business idea (SSE). */
+/** Generate a Venture Intelligence report for a business idea (SSE). */
 export function streamVenture(
   idea: string,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
-  deep = false,
 ): Promise<void> {
-  return postStream("/api/venture", { idea, deep }, onEvent, signal)
+  return postStream("/api/venture", { idea }, onEvent, signal)
 }
 
-/** Run a Company X-Ray analysis for an existing company (SSE). */
+/** Generate a Company X-Ray report for an existing company (SSE). */
 export function streamAnalysis(
   company: string,
   analysisType: AnalysisType,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
-  deep = false,
 ): Promise<void> {
   return postStream(
     "/api/analyze",
-    { company, analysis_type: analysisType, deep },
+    { company, analysis_type: analysisType },
     onEvent,
     signal,
   )

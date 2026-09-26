@@ -1,10 +1,14 @@
 """
 Thrace backend API.
 
-FastAPI server that exposes the multi-agent intelligence engine over HTTP with
+FastAPI server exposing the fast intelligence engine over HTTP with
 Server-Sent Events (SSE) streaming, plus server-side persistence, an
 autonomous scheduler (watchlist re-validation + in-app digests), opportunity
 discovery and report Q&A.
+
+Every interactive feature — Venture Intelligence, Company X-Ray and Discovery —
+runs the same way: one streaming model call, then optional lightweight source
+retrieval that never blocks the response.
 """
 import json
 import os
@@ -72,14 +76,10 @@ app.add_middleware(
 class AnalyzeRequest(BaseModel):
     company: str
     analysis_type: str = "competitor"
-    # Instant (one streaming call, no research) unless the client asks for the
-    # full research pipeline.
-    deep: bool = False
 
 
 class VentureRequest(BaseModel):
     idea: str
-    deep: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -96,10 +96,10 @@ AUTONOMOUS_FEATURES = [
     "persistence",
     "watchlist_revalidation",
     "in_app_digest",
-    "self_critique",
-    "adaptive_research",
     "opportunity_discovery",
     "report_qa",
+    "streaming",
+    "lightweight_sources",
 ]
 
 
@@ -178,52 +178,10 @@ def analyze(req: AnalyzeRequest):
     if not status["ready"]:
         raise HTTPException(
             status_code=503,
-            detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
+            detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) in .env",
         )
 
-    def worker_research(q: queue.Queue):
-        def emit(event_type: str, **fields):
-            q.put({"type": event_type, **fields})
-
-        try:
-            # Instant preliminary read so the user sees text within ~1-2s.
-            emit(
-                "status",
-                label="Preliminary read",
-                detail=f"Drafting an immediate first impression of {company}…",
-            )
-            for event in agents.xray_provisional(analysis_type, company):
-                q.put(event)
-
-            emit("status", label="Searching the web", detail=f"Scanning live sources for {company}...")
-            bullets = agents.run_bullets(analysis_type, company)
-
-            emit("status", label="Synthesising insights", detail="Agents are reasoning over the gathered evidence...")
-            emit("stage_start", stage="report", label="Report")
-
-            # The preliminary read is the only text on screen at this point, so
-            # it is discarded only once the researched report actually produces
-            # content. Clearing it up front left a blank report whenever the
-            # researched pass returned nothing.
-            researched = False
-            for event in agents.stream_report(analysis_type, company, bullets):
-                if not researched and event.get("type") == "delta" and event.get("data"):
-                    researched = True
-                    emit("reset")
-                q.put(event)
-
-            if not researched:
-                emit(
-                    "status",
-                    label="Research incomplete",
-                    detail="Live research returned no findings — showing the preliminary read.",
-                )
-
-            emit("done")
-        except Exception as exc:  # noqa: BLE001
-            emit("error", message=str(exc))
-
-    def worker_instant(q: queue.Queue):
+    def worker(q: queue.Queue):
         try:
             for event in agents.run_instant_xray(analysis_type, company):
                 q.put(event)
@@ -231,12 +189,12 @@ def analyze(req: AnalyzeRequest):
         except Exception as exc:  # noqa: BLE001
             q.put({"type": "error", "message": str(exc)})
 
-    return _sse_stream(worker_research if req.deep else worker_instant)
+    return _sse_stream(worker)
 
 
 @app.post("/api/venture")
 def venture(req: VentureRequest):
-    """Run the Venture Intelligence pipeline for a business idea (SSE stream)."""
+    """Generate a Venture Intelligence report for a business idea (SSE stream)."""
     idea = req.idea.strip()
 
     if not idea:
@@ -248,17 +206,12 @@ def venture(req: VentureRequest):
     if not status["ready"]:
         raise HTTPException(
             status_code=503,
-            detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
+            detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) in .env",
         )
 
     def worker(q: queue.Queue):
         try:
-            source = (
-                agents.run_venture_pipeline(idea)
-                if req.deep
-                else agents.run_instant_venture(idea)
-            )
-            for event in source:
+            for event in agents.run_instant_venture(idea):
                 q.put(event)
             q.put({"type": "done"})
         except Exception as exc:  # noqa: BLE001

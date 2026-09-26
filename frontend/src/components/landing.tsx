@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react"
 import { ArrowUpRight } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
-import { setDeepResearch, useDeepResearch } from "@/lib/research-mode"
 import type { AnalysisType, RunMode } from "@/lib/api"
 
 interface LandingProps {
@@ -14,16 +13,10 @@ const MODES = [
   { id: "xray" as const, label: "Company X-Ray" },
 ]
 
-const RESEARCH_MODES = [
-  { deep: false, label: "instant" },
-  { deep: true, label: "deep_research()" },
-]
-
 export function Landing({ onAnalyze }: LandingProps) {
   const [idea, setIdea] = useState("")
   const [tab, setTab] = useState<"venture" | "xray">("venture")
   const [busy, setBusy] = useState(false)
-  const deep = useDeepResearch()
   const taRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
@@ -123,30 +116,8 @@ export function Landing({ onAnalyze }: LandingProps) {
             </div>
           </div>
 
-          {/* How the report is produced. Instant writes the whole report in one
-              model pass with no research; deep runs the research pipeline. */}
-          <div className="mt-6 inline-flex border border-border/70 bg-card/40 p-0.5 sm:mt-8">
-            {RESEARCH_MODES.map((option) => (
-              <button
-                key={option.label}
-                type="button"
-                onClick={() => setDeepResearch(option.deep)}
-                className={cn(
-                  "min-h-9 px-3 py-1.5 font-mono text-xs tracking-wide transition-colors sm:min-h-0 sm:px-4",
-                  deep === option.deep
-                    ? "bg-primary/[0.10] text-primary"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-
-          <p className="text-data-sm mt-3 text-muted-foreground/50">
-            {deep
-              ? "researches the live web first — slower, cites sources"
-              : "one pass, no research — fastest, no live sources"}
+          <p className="text-data-sm mt-6 text-muted-foreground/50 sm:mt-8">
+            one analytical pass — fastest, with a few real sources attached
           </p>
         </div>
       </main>
