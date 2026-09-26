@@ -40,10 +40,18 @@ def install_stubs(provisional: list[dict], report: list[dict]) -> None:
     agents.stream_report = lambda analysis_type, company, bullets: iter(report)
 
 
-def drive_analyze() -> list[dict]:
-    """Run /api/analyze end to end and return the events the client would see."""
+def drive_analyze(deep: bool = True) -> list[dict]:
+    """Run /api/analyze end to end and return the events the client would see.
+
+    `deep=True` exercises the research path (where the blank-report bug lived);
+    the default request is now the instant path, so tests must ask for deep.
+    """
     async def collect():
-        resp = main.analyze(main.AnalyzeRequest(company="Moniepoint", analysis_type="competitor"))
+        resp = main.analyze(
+            main.AnalyzeRequest(
+                company="Moniepoint", analysis_type="competitor", deep=deep
+            )
+        )
         events = []
         async for chunk in resp.body_iterator:
             text = chunk if isinstance(chunk, str) else chunk.decode()
@@ -117,6 +125,29 @@ except RuntimeError:
     check("blank answer raises instead of closing empty", True)
 check("Q&A prompt is anchored to the chat subject", "Moniepoint" in captured.get("prompt", ""))
 check("Q&A prompt forbids starting a new analysis", "do not" in captured.get("prompt", ""))
+
+# --- 4. routing: instant is the default, deep opts into research -----------
+# Mirrors what agents.run_instant_xray really yields: a status, the report
+# stage, then the report text.
+agents.run_instant_xray = lambda analysis_type, company: iter(
+    [
+        {"type": "status", "label": "Drafting report", "detail": "stub"},
+        {"type": "stage_start", "stage": "report", "label": "Report"},
+        {"type": "delta", "data": "INSTANT READ"},
+    ]
+)
+instant_events = drive_analyze(deep=False)
+instant_types = [e["type"] for e in instant_events]
+check(
+    "a default request takes the instant path (no research stages)",
+    replay_client(instant_events) == "INSTANT READ" and "stage_start" in instant_types,
+    f"events={instant_types}",
+)
+check(
+    "the instant path does not touch the research pipeline",
+    "reset" not in instant_types and instant_types[-1] == "done",
+    f"events={instant_types}",
+)
 
 print()
 if FAILURES:

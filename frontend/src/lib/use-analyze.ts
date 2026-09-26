@@ -13,6 +13,7 @@ import {
   type RunMode,
   type StreamEvent,
 } from "@/lib/api"
+import { isDeepResearch } from "@/lib/research-mode"
 
 export interface StageState {
   id: string
@@ -542,9 +543,9 @@ export function useAnalyze() {
       }
       stream = streamAsk(report, query, onEvent, controller.signal, chat?.query)
     } else if (mode === "venture") {
-      stream = streamVenture(query, onEvent, controller.signal)
+      stream = streamVenture(query, onEvent, controller.signal, isDeepResearch())
     } else if (mode === "competitor" || mode === "sentiment" || mode === "metrics") {
-      stream = streamAnalysis(query, mode, onEvent, controller.signal)
+      stream = streamAnalysis(query, mode, onEvent, controller.signal, isDeepResearch())
     } else {
       // monitor/digest exchanges arrive server-side only
       return

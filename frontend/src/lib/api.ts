@@ -143,8 +143,9 @@ export function streamVenture(
   idea: string,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
+  deep = false,
 ): Promise<void> {
-  return postStream("/api/venture", { idea }, onEvent, signal)
+  return postStream("/api/venture", { idea, deep }, onEvent, signal)
 }
 
 /** Run a Company X-Ray analysis for an existing company (SSE). */
@@ -153,10 +154,11 @@ export function streamAnalysis(
   analysisType: AnalysisType,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
+  deep = false,
 ): Promise<void> {
   return postStream(
     "/api/analyze",
-    { company, analysis_type: analysisType },
+    { company, analysis_type: analysisType, deep },
     onEvent,
     signal,
   )

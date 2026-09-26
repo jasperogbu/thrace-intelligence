@@ -266,6 +266,36 @@ def _is_quota_error(exc: Exception) -> bool:
     return "429" in msg or "resource_exhausted" in msg or "quota" in msg
 
 
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """True when the provider says the *daily* allowance is gone.
+
+    This is not a burst limit: it will not clear by retrying in a few seconds,
+    so grinding through the model pool only delays the error the user needs to
+    see. Wording is deliberately free of the `_TRANSIENT_MARKERS` tokens so the
+    raised message is not itself retried by the layers above.
+    """
+    msg = str(exc).lower()
+    return "generaterequestsperday" in msg or "per day" in msg
+
+
+def _all_models_benched() -> bool:
+    now = time.monotonic()
+    with _rotation_lock:
+        pool = _model_pool()
+        return bool(pool) and all(_quota_marks.get(m, 0.0) > now for m in pool)
+
+
+def _quota_exhausted_error() -> RuntimeError:
+    pool = ", ".join(_model_pool())
+    return RuntimeError(
+        "Daily free-tier ceiling reached for every pooled model "
+        f"({pool}). Nothing can be generated until the allowance resets. "
+        "Add a paid key, or another provider via LLM_API_KEY / LLM_BASE_URL, "
+        "to lift the ceiling — instant mode already needs one request per "
+        "report instead of roughly twenty."
+    )
+
+
 def _parse_retry_delay(exc: Exception) -> float:
     """Extract the provider's 'Please retry in Ns' window from a quota error."""
     m = _RETRY_DELAY_RE.search(str(exc))
@@ -582,6 +612,11 @@ def _rotate_on(model: str, exc: Exception, attempt: int, max_attempts: int) -> b
     if attempt >= max_attempts or not _is_transient_error(exc):
         return False
     _mark_model_exhausted(model, _bench_seconds(exc))
+    if _is_daily_quota_error(exc) and _all_models_benched():
+        # Every pooled model is out of daily allowance. Rotating again cannot
+        # succeed, and the sleeps would stall the run for minutes before
+        # surfacing an error — so surface it now.
+        raise _quota_exhausted_error()
     print(
         f"[thrace] {model} unavailable/rate-limited; rotating to the next model",
         flush=True,
@@ -1562,6 +1597,202 @@ def _stream_synthesis(prompt: str) -> Iterator[dict]:
             time.sleep(wait)
             continue
         raise failure
+
+
+# ---------------------------------------------------------------------------
+# Instant reports (no research)
+# ---------------------------------------------------------------------------
+# The research pipeline is what makes a report slow: five stages, each running
+# an agent with web tools, so one run is many sequential model round-trips (and
+# on the free tier the quota turns those into rotations and cooldowns). The
+# instant path replaces all of it with ONE streaming call, so the first tokens
+# arrive in about a second and nothing waits on a search.
+#
+# The trade-off is honest and deliberate: with no research there are no live
+# sources, so the analyst is forbidden from printing citations it cannot back.
+_INSTANT_ANALYST_RULES = dedent("""
+    You are Thrace's instant analyst. You write complete, decision-ready reports
+    from your own knowledge, immediately, with no research tools and no live
+    data.
+
+    Hard rules:
+    - Never fabricate sources, URLs or citations. Do not print a list of links.
+      You did not search the web, and you must not imply that you did.
+    - Never invent precise statistics. When a figure is an estimate, label it
+      "estimate" and state the assumption behind it.
+    - Be specific, quantitative where you can, and decisive. This is an
+      analyst's brief, not a hedge.
+    - Markdown. Tables where they help, concise bullets elsewhere, no long
+      paragraphs.
+""")
+
+
+_instant_agent_cache: Agent | None = None
+
+
+def _instant_agent() -> Agent:
+    global _instant_agent_cache
+    if _instant_agent_cache is None:
+        _instant_agent_cache = Agent(
+            name="Thrace Instant Analyst",
+            description=_INSTANT_ANALYST_RULES,
+            model=_chat_model(),
+            markdown=True,
+        )
+    return _instant_agent_cache
+
+
+def _clear_instant_agent() -> None:
+    global _instant_agent_cache
+    _instant_agent_cache = None
+
+
+def instant_venture_prompt(idea: str) -> str:
+    return dedent(f"""
+        Write the complete Venture Intelligence Report for this business idea now,
+        in one pass, from your own analysis.
+
+        Idea: "{idea}"
+
+        === FORMAT SPECIFICATION ===
+        # Venture Intelligence Report — {idea}
+        ## Executive Verdict
+        One bold line: verdict (PURSUE / PIVOT / DROP), probability-of-success
+        percentage and its band, then <=80 words of reasoning.
+        ## 1. Idea Validation
+        Problem evidence, demand signals and a validation verdict (concise bullets).
+        ## 2. Market & Location Intelligence
+        TAM/SAM/SOM table, customer segments, local context, pricing tolerance.
+        ## 3. Competitive Landscape
+        Competitor table (name | offering | pricing | strength | gap), then the
+        white space a new entrant could take.
+        ## 4. Risk & Success Assessment
+        Scoring table, SWOT, risk register (risk | likelihood | impact | mitigation).
+        ## 5. Venture Plan & Roadmap
+        Business model, startup costs table, funding options, go-to-market,
+        0-90-day and 3-12-month roadmap, regulatory checklist, KPIs.
+        ## Basis
+        Two or three lines naming the assumptions this analysis rests on and what
+        must be verified before acting on it.
+    """)
+
+
+def instant_xray_prompt(analysis_type: str, company: str) -> str:
+    if analysis_type == "sentiment":
+        body = dedent(f"""
+            ### Positive Sentiment
+            - up to 6 bullets
+            ### Negative Sentiment
+            - up to 6 bullets
+            ### Overall Summary
+            <=120 words on the balance and what drives it.
+        """)
+    elif analysis_type == "metrics":
+        body = dedent(f"""
+            ## Key Performance Indicators
+            | Metric | Value / Detail | Confidence |
+            |---|---|---|   (one row per KPI)
+            ## Qualitative Signals
+            - up to 5 bullets
+            ## Summary & Implications
+            <=120 words on what the numbers imply and what to watch next.
+        """)
+    else:
+        body = dedent(f"""
+            # {company} — Launch Review
+            ## 1. Market & Product Positioning
+            - up to 6 bullets on how {company} is positioned
+            ## 2. Launch Strengths
+            | Strength | Rationale |
+            |---|---|   (4-6 rows)
+            ## 3. Launch Weaknesses
+            | Weakness | Rationale |
+            |---|---|   (4-6 rows)
+            ## 4. Strategic Takeaways for Competitors
+            1. up to 5 numbered points
+        """)
+    return dedent(f"""
+        Write the complete {analysis_type} report on {company} now, in one pass,
+        from your own analysis.
+
+        === FORMAT SPECIFICATION ===
+        {body}
+    """)
+
+
+def _stream_instant(prompt: str) -> Iterator[dict]:
+    """Stream a knowledge-based report, restarting once on transient failure."""
+    emitted = False
+    attempt = 0
+    while True:
+        attempt += 1
+        failure: Exception | None = None
+        for event in _instant_agent().run(prompt, stream=True):
+            if isinstance(event, AgentRunContentEvent):
+                if event.content:
+                    emitted = True
+                    yield {"type": "delta", "data": event.content}
+            elif isinstance(event, AgentRunErrorEvent):
+                failure = RuntimeError(
+                    f"Report generation failed: {event.content or event.error_type or 'unknown'}"
+                )
+                break
+        if failure is None:
+            return
+        if attempt < _STAGE_MAX_ATTEMPTS and _is_transient_error(failure):
+            if emitted:
+                yield {"type": "reset"}
+                emitted = False
+            _clear_instant_agent()
+            wait = _STAGE_RETRY_DELAY * attempt
+            print(
+                f"[thrace] transient provider error in instant report "
+                f"(attempt {attempt}/{_STAGE_MAX_ATTEMPTS}); restarting in {wait}s — "
+                f"{str(failure)[:200]}",
+                flush=True,
+            )
+            time.sleep(wait)
+            continue
+        raise failure
+
+
+def run_instant_venture(idea: str) -> Iterator[dict]:
+    """Write a whole Venture Intelligence Report in one streaming call.
+
+    One model request, no tools, no research stages. The caller emits `done`.
+    """
+    started = time.monotonic()
+    yield {
+        "type": "status",
+        "label": "Drafting report",
+        "detail": "Writing the report now — instant mode, no research pass.",
+    }
+    yield {"type": "stage_start", "stage": "report", "label": "Report"}
+    yield from _stream_instant(instant_venture_prompt(idea))
+    print(
+        f"[thrace] instant venture report in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
+
+
+def run_instant_xray(analysis_type: str, company: str) -> Iterator[dict]:
+    """Write a whole Company X-Ray report in one streaming call.
+
+    One model request, no tools, no research stages. The caller emits `done`.
+    """
+    started = time.monotonic()
+    yield {
+        "type": "status",
+        "label": "Drafting report",
+        "detail": f"Writing the {company} report now — instant mode, no research pass.",
+    }
+    yield {"type": "stage_start", "stage": "report", "label": "Report"}
+    yield from _stream_instant(instant_xray_prompt(analysis_type, company))
+    print(
+        f"[thrace] instant {analysis_type} report for {company} "
+        f"in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
 
 
 def run_venture_pipeline(idea: str) -> Iterator[dict]:

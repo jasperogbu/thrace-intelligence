@@ -212,6 +212,10 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
           ) : (
             (run.exchanges ?? []).map((ex) => {
               const isFollowUp = ex.mode !== run.mode
+              // Only show the stage table once stages have actually started. An
+              // instant report never runs them, so it would sit at five pending.
+              const showPipeline =
+                ex.mode === "venture" && ex.stages.some((s) => s.status !== "pending")
               return (
                 <div key={ex.id} className="space-y-4">
                   {/* Request */}
@@ -233,7 +237,7 @@ export function Workspace({ run, mode, watched, onModeChange, onRun, onToggleWat
                   <div className="min-w-0">
                     {ex.status === "running" && (
                       <div className={ex.content ? "mb-4" : ""}>
-                        {ex.mode === "venture" ? (
+                        {showPipeline ? (
                           <PipelineSteps
                             stages={ex.stages}
                             detail={ex.statusDetail}

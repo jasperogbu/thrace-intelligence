@@ -72,10 +72,14 @@ app.add_middleware(
 class AnalyzeRequest(BaseModel):
     company: str
     analysis_type: str = "competitor"
+    # Instant (one streaming call, no research) unless the client asks for the
+    # full research pipeline.
+    deep: bool = False
 
 
 class VentureRequest(BaseModel):
     idea: str
+    deep: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -177,7 +181,7 @@ def analyze(req: AnalyzeRequest):
             detail="Thrace is not ready. Configure a model key (LLM_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY) and FIRECRAWL_API_KEY in .env",
         )
 
-    def worker(q: queue.Queue):
+    def worker_research(q: queue.Queue):
         def emit(event_type: str, **fields):
             q.put({"type": event_type, **fields})
 
@@ -219,7 +223,15 @@ def analyze(req: AnalyzeRequest):
         except Exception as exc:  # noqa: BLE001
             emit("error", message=str(exc))
 
-    return _sse_stream(worker)
+    def worker_instant(q: queue.Queue):
+        try:
+            for event in agents.run_instant_xray(analysis_type, company):
+                q.put(event)
+            q.put({"type": "done"})
+        except Exception as exc:  # noqa: BLE001
+            q.put({"type": "error", "message": str(exc)})
+
+    return _sse_stream(worker_research if req.deep else worker_instant)
 
 
 @app.post("/api/venture")
@@ -241,7 +253,12 @@ def venture(req: VentureRequest):
 
     def worker(q: queue.Queue):
         try:
-            for event in agents.run_venture_pipeline(idea):
+            source = (
+                agents.run_venture_pipeline(idea)
+                if req.deep
+                else agents.run_instant_venture(idea)
+            )
+            for event in source:
                 q.put(event)
             q.put({"type": "done"})
         except Exception as exc:  # noqa: BLE001
