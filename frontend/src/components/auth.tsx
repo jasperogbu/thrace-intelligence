@@ -138,28 +138,39 @@ export function AuthView({ onAuthed, onBack }: AuthViewProps) {
 
       {/* Two-column split: the hero sits opposite the form, and swaps sides
           when the tab toggles. The form markup itself is untouched — only the
-          column order changes, so nothing about the existing design moves. */}
-      <main className="flex w-full flex-1 flex-col lg:flex-row lg:items-center lg:gap-10 xl:gap-16">
-        {/* Hero */}
+          column order and the outer padding change.
+
+          The split is `xl` and up (1280px), so it shows on laptops and
+          desktops only. Below that the hero is not rendered at all and the
+          page is the original single narrow column, so phones and tablets get
+          the form full-screen rather than a squeezed image. */}
+      <main className="flex w-full flex-1 flex-col xl:flex-row xl:items-center xl:gap-8 2xl:gap-12">
+        {/* Hero — desktop and laptop only */}
         <div
-          className={`w-full px-5 pt-8 sm:px-8 lg:flex lg:min-h-0 lg:flex-1 lg:items-center lg:px-10 lg:py-12 ${
-            isLogin ? "lg:order-1" : "lg:order-2"
+          className={`hidden w-full xl:flex xl:min-h-0 xl:flex-1 xl:items-center xl:py-12 2xl:py-14 ${
+            isLogin ? "xl:order-1 xl:pl-10 2xl:pl-14" : "xl:order-2 xl:pr-10 2xl:pr-14"
           }`}
         >
           <img
-            src="/thracehero.png"
+            src="/thracehero.webp"
             alt="Thrace — autonomous startup intelligence"
-            className="w-full rounded-sm border border-border/60 object-cover shadow-[0_0_0_1px_rgba(255,255,255,0.02),0_30px_80px_-40px_rgba(0,0,0,0.9)] lg:max-h-[78vh] lg:object-contain"
+            className="w-full rounded-sm border border-border/60 object-cover shadow-[0_0_0_1px_rgba(255,255,255,0.02),0_30px_80px_-40px_rgba(0,0,0,0.9)] xl:max-h-[80vh] xl:object-contain"
             draggable={false}
           />
         </div>
 
         {/* Form column. `mx-auto max-w-sm` keeps the original narrow, centred
-            form on phones; from `lg` the two-column split takes over and the
-            column is sized by the layout instead. */}
+            form on small screens; from `xl` the two-column split takes over and
+            the column is sized by the layout instead.
+
+            The padding is deliberately asymmetric so the form sits closer to
+            the image and further from the screen edge — more room on whichever
+            side the image is not. */}
         <div
-          className={`mx-auto flex w-full max-w-sm flex-col justify-center px-5 py-10 sm:px-6 lg:mx-0 lg:max-w-none lg:flex-none lg:px-8 xl:px-10 ${
-            isLogin ? "lg:order-2 lg:w-[26rem]" : "lg:order-1 lg:w-[26rem]"
+          className={`mx-auto flex w-full max-w-sm flex-col justify-center px-5 py-10 sm:px-6 xl:mx-0 xl:max-w-none xl:flex-none xl:py-12 ${
+            isLogin
+              ? "xl:order-2 xl:w-[26rem] xl:pl-8 xl:pr-20 2xl:pr-28"
+              : "xl:order-1 xl:w-[26rem] xl:pl-20 xl:pr-8 2xl:pl-28"
           }`}
         >
           {/* Brand */}

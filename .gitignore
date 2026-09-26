@@ -15,5 +15,3 @@ frontend/.vite/
 # runtime data
 backend/data/
 
-# untracked local assets
-thracehero.png
