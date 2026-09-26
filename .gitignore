@@ -4,7 +4,6 @@ __pycache__/
 *.pyc
 .agents/
 .DS_Store
-report/
 backend/*.log
 
 # frontend
