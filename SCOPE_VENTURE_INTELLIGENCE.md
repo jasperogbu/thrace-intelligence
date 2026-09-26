@@ -1,7 +1,8 @@
 # Thrace — Venture Intelligence: Scope & Project Plan
 
-> Project: Autonomous Startup Intelligence Platform for Business Discovery and Venture Planning
-> Status: **BUILT & RUNNING** — full stack with autonomous capabilities, verified end-to-end
+> Project: Startup Intelligence Platform for Business Discovery and Venture Planning
+> Status: **BUILT & RUNNING** — full stack, verified end-to-end
+> Architecture: fast single-analyst intelligence layer with lightweight sources
 > Branding: Thrace, terminal aesthetic, XVII MAY LTD
 
 ---
@@ -11,202 +12,243 @@
 Thrace answers one question for a founder: *is this idea worth pursuing — and if
 so, how do I execute it?*
 
-The user types a **business idea** (e.g., "Start a food processing business in
-Jos, Nigeria") → Thrace **validates the idea** and delivers **intelligence at
-every stage of business planning**, producing an evidence-backed **Venture
-Intelligence Report** that includes:
+The user types a **business idea** (e.g., *"AI-powered marketplace for Nigerian
+farmers"*) and Thrace returns a structured **Venture Intelligence Report**:
+an executive verdict, the opportunity, target customers, market sizing,
+competition, business model, key risks, a validation plan, recommended next
+steps, and a short list of real source links.
 
-- **Idea validation verdict** — pursue / pivot / drop, with reasoning
-- **Probability of success** — a structured, weighted score with rationale
-- **Competitor landscape** — local and online, with differentiation openings
-- **Planning & execution intelligence** — market size, customers, costs, pricing,
-  go-to-market, roadmap, regulations, risks, KPIs
-
-A secondary mode, **Company X-Ray**, researches an existing company (positioning,
-sentiment, KPIs) using the same agent engine.
-
-Thrace is also **autonomous** beyond on-demand reports: agents self-critique and
-deepen weak evidence, watch subjects and re-validate them on a schedule, digest
-changes in-app, discover new opportunities from live signals, and answer
-follow-up questions over any report (see section 4b).
+A secondary capability, **Company X-Ray**, applies the same intelligence layer
+to an existing company. A third, **Discovery**, proposes business opportunities
+*worth validating*.
 
 ---
 
-## 2. Primary User Journey
+## 2. Architectural Position
 
-1. Visitor lands on Thrace. The hero input asks for a **business idea**:
-   *"e.g. Start a food processing business in Jos…"*
-2. On submit, the **Venture Intelligence Pipeline** runs — five stages, each handled
-   by a specialised agent, with live status streamed to the UI (SSE).
-3. The **Venture Intelligence Report** streams into the terminal, section by
-   section, with every claim tied to cited web sources.
-4. The user leaves with an actionable answer to: *Is this idea worth pursuing —
-   and if so, how do I execute it?*
-5. Completed reports are archived in the **Library**; a new idea can be submitted
-   directly from the workspace input.
+### 2.1 The principle
 
----
+> **Fast intelligence first. Deep research is optional, not the default.**
 
-## 3. The Venture Intelligence Pipeline
+Thrace uses the model's existing knowledge to produce useful intelligence
+immediately, and attaches a small number of real sources when they are
+available. It does not run deep research before responding.
 
-| # | Stage | Agent | Key questions answered |
-|---|-------|-------|------------------------|
-| 1 | **Idea Validation** | Venture Validation Agent | Is this a real, painful problem? Is there demand evidence (search trends, local signals)? Is the idea clear enough to test? Verdict: **pursue / pivot / drop** + reasoning |
-| 2 | **Market & Location Intelligence** | Market Intelligence Agent | Market size (localised TAM/SAM/SOM), target customer segments & personas, local economic context (e.g., Jos: population, commerce, income), pricing tolerance and spending power |
-| 3 | **Competitive Landscape** | Competition Analysis Agent | Direct/indirect competitors in the target location & online; their strengths, gaps and pricing; white-space / differentiation opportunities |
-| 4 | **Risk & Success Assessment** | Risk & Success Agent | Weighted scoring rubric → **probability-of-success score**; SWOT; risk register with likelihood, impact, and mitigations |
-| 5 | **Venture Plan & Roadmap** | Venture Planning Agent | Recommended business model & pricing, startup cost estimate (₦), funding options, go-to-market strategy, phased execution roadmap (0–90 days, 3–12 months), regulatory steps (CAC, licences), KPIs to track |
+### 2.2 What changed, and why
 
-Each stage runs web search + crawl (Firecrawl) so every section is grounded in
-live evidence, and each section ends with a **Sources** list. After each stage,
-an **Evidence Critic** reviews the brief; when evidence is weak, the stage agent
-re-researches the specific gaps (self-critique + adaptive research budget)
-before the **Thrace Lead Analyst** synthesises the five stage briefs into the
-final report, which streams to the client as Markdown deltas.
+The platform was originally built as a deep-research system: a five-stage
+venture pipeline in which specialist agents (validation, market, competition,
+risk, planning) each ran with web search and crawl tools, executed in waves,
+then handed their briefs to a lead analyst for synthesis. Company X-Ray used a
+parallel three-agent team. Discovery ran up to four web searches per request
+before proposing a single idea.
 
-### Probability-of-success rubric (Stage 4)
+That architecture was thorough and it was unusable. Measured on the free-tier
+model pool, a Venture Intelligence report took 54.4s, Company X-Ray 28.7s, and
+time-to-first-token varied between 2s and 95s on identical requests. Two
+distinct causes were identified and both were real:
 
-Each dimension scored 0–10, weighted, rolled into one composite score and band:
+1. **Output volume.** The venture prompt asked for a TAM/SAM/SOM table, a SWOT,
+   a risk register, a startup-cost table, a two-horizon roadmap, a regulatory
+   checklist and KPIs. This reliably produced ~14.2k characters of dense
+   markdown, and generation time scales with output length.
+2. **Model selection.** The model pool rotated blindly across sibling models
+   that the same free tier served at wildly different speeds — measured between
+   0.8s and 28s to first token. Roughly a third of all requests went to the
+   slowest model.
 
-| Dimension | Weight |
-|-----------|--------|
-| Market demand evidence | 25% |
-| Competitive intensity (inverse) | 20% |
-| Execution complexity (inverse) | 15% |
-| Capital accessibility | 15% |
-| Location & regulatory fit | 15% |
-| Timing / trend alignment | 10% |
+The current architecture replaces the staged pipeline with a single streaming
+model call and fixes model selection empirically. The deep-research
+architecture is not part of the system; it is documented here as history.
 
-**Bands:** ≥ 70% **Strong** · 50–69% **Promising** · 35–49% **Speculative** · < 35% **High-risk**
+### 2.3 What the current system does not do
+
+- No sequential multi-agent orchestration
+- No deep crawling or recursive site inspection
+- No research loop that blocks the response
+- No model-generated URLs, ever
+- No fabricated statistics, companies, funding rounds or citations
 
 ---
 
-## 4. Company X-Ray (secondary mode)
+## 3. Primary User Journey
 
-The X-Ray mode researches an **existing company** the user names (e.g., "Opay").
-Three agents coordinate through the Thrace Intelligence Team:
-
-| Agent | Focus |
-|-------|-------|
-| Startup / Competitor Analysis Agent | Positioning, launch strategy, strengths, weaknesses |
-| Market Sentiment Analysis Agent | Social/review sentiment, perception drivers, reception |
-| Performance Metrics Agent | Adoption, revenue and growth KPIs vs benchmarks |
-
-In the app UI, the chat mode switcher exposes three modes — **VENT** (Venture
-Intelligence), **COMP** (Company X-Ray, which runs the competitor analysis) and
-**ASK** (report Q&A, enabled once the chat holds a report). Chats are
-conversational: new prompts continue the same chat as additional turns.
+1. The user lands on Thrace and types a **business idea** into the hero input.
+2. The request is accepted immediately and the first words of the report appear
+   within a few seconds.
+3. The **Venture Intelligence Report** streams into the workspace, section by
+   section, while background source collection runs independently.
+4. The report ends with 3–5 real, clickable source links.
+5. The user leaves with an actionable answer, and can ask a follow-up question
+   answered strictly from the report.
+6. Completed reports are archived in the **Library**; opportunities discovered
+   in **Discovery** can be validated with one click.
 
 ---
 
-## 4b. Autonomous capabilities
+## 4. The Three Capabilities
 
-| # | Capability | Implementation |
-|---|------------|----------------|
-| 1 | **Watchlist re-validation** | Any chat can be watched; a scheduler thread re-runs a Monitoring Agent against the subject (weekly by default, `REVAL_INTERVAL_HOURS`) and appends *what changed* updates into the chat server-side |
-| 2 | **Server-side persistence** | SQLite (`backend/store.py`, `backend/data/`): runs, exchanges and watchlist; completed turns sync fire-and-forget from the client |
-| 3 | **In-app alert digest** | Monitoring updates aggregate daily (`DIGEST_INTERVAL_HOURS`) into an Intelligence Digest chat; manual `run_cycle_now()` trigger in Settings |
-| 4 | **Self-critique loop** | Evidence Critic reviews every stage brief; `REVISE` verdicts trigger a targeted re-research pass |
-| 5 | **Adaptive research budget** | Extra searches run only where the critic finds gaps — deep on thin evidence, fast on solid evidence |
-| 6 | **Opportunity discovery** | `/api/discover` + Discover view: agents scan live news/trends and propose validated-ready ideas (one click launches the pipeline) |
-| 7 | **Report Q&A** | `/api/ask` + ASK mode: follow-up questions answered strictly from the report content — no new pipeline run |
+All three share the same execution strategy: **one streaming model call, then
+optional lightweight sources**.
 
-The frontend polls `/api/updates` every 30 seconds and merges autonomous
-re-validations and digests into the chat list; chats, turns and watched state
-survive reloads (localStorage + SQLite).
+| | Venture Intelligence | Company X-Ray | Discovery |
+|---|---|---|---|
+| **Subject** | A new business idea | An existing company | A region, sector or question |
+| **Output** | Structured validation report | Structured company analysis | 4 opportunity cards |
+| **Tools** | none | none | none |
+| **Output cap** | 1300 tokens | 1000 tokens | 900 tokens |
+| **Sources** | 3–5 real links | 3–5 real links | 3–5 real links |
+| **Measured total** | 8–14s | 6–10s | 5–10s |
+
+### 4.1 Venture Intelligence
+
+Sections: Executive Summary (verdict + 3 bullets) · Opportunity · Target
+Customers · Market (one paragraph + TAM/SAM/SOM table, figures labelled
+*estimate*) · Competition (incumbents, pricing, the gap you exploit) · Business
+Model · Key Risks (each with its mitigation) · Validation Plan (tests ordered
+cheapest-first, with falsification criteria) · Recommended Next Steps · Sources.
+
+The prompt fixes the section list and gives each section a word budget. Depth is
+available on demand through follow-up questions rather than paid for upfront.
+
+### 4.2 Company X-Ray
+
+Sections for `competitor`: Company Overview · Product & Target Market · Business
+Model · Competitive Position · Strengths · Weaknesses & Risks · Opportunities ·
+Key Takeaways · Sources. `sentiment` and `metrics` restructure the report around
+perception drivers and KPIs respectively.
+
+A URL supplied by the user is passed to the model as a hint about which company
+is meant. The site is not fetched.
+
+### 4.3 Discovery
+
+A no-tools analyst proposes opportunities from pretrained knowledge. Two rules
+are enforced in the prompt and are the point of the feature:
+
+- **Language discipline.** Every idea is a *hypothesis worth validating*, not a
+  finding. The analyst is instructed to say "appears worth validating" and
+  "the first thing to test", and never "the market is proven" or "demand is
+  confirmed".
+- **No fabrication.** No invented statistics, companies, people or URLs.
+
+Each idea block is emitted the moment it completes, so cards appear while the
+analyst is still writing. Any card launches directly into Venture Intelligence.
 
 ---
 
-## 5. Architecture
+## 5. The Intelligence Layer
+
+`backend/intelligence.py` holds the strategy shared by all three features.
+
+### 5.1 Analyst rules
+
+One system prompt, enforced everywhere: never fabricate sources, URLs,
+citations, statistics, companies, people or funding rounds; label estimates as
+estimates and state the assumption behind them; hedge judgements rather than
+asserting them; never imply that research was performed; answer directly and
+avoid repetition.
+
+### 5.2 Source collection
+
+The model is forbidden from writing a URL. Real links are attached by the
+backend in three tiers, each filling only what the tier above left short:
+
+1. **Live search** — most specific, always first
+2. **Curated official bodies** scored against the query
+3. **Broad cross-sector bodies** — to reach the floor
+
+Relevance is scored, not first-matched, with a locale boost. *"Fintech in
+Nigeria"* leads with the Central Bank of Nigeria and the securities regulator
+rather than a global institution. The result is always 3–5 deduplicated real
+links, and the list is capped at 5.
+
+Retrieval runs on a background thread started **before** generation, so it is
+usually finished by the time the report is. A bounded wait follows, and every
+failure is swallowed: a dead search backend costs the user their sources, never
+their report.
+
+### 5.3 Streaming
+
+`stream_agent` retries a transient failure once on a fresh model; a restart
+emits a `reset` event so the client clears partial text rather than showing two
+stitched attempts. Permanent errors — bad key, bad model id, malformed request
+— are never retried.
+
+### 5.4 Truncation guard
+
+The output cap is the main reason generation is fast, and a report cut off
+mid-sentence reads as a bug. Finished reports are checked for a truncation
+signature and the condition is logged rather than silently shipped.
+
+---
+
+## 6. Architecture
 
 ### Stack
-- **Backend** — FastAPI + Agno multi-agent engine, Gemini (via Google's native
-  SDK) with Firecrawl web search/crawl tools
-- **Frontend** — React 19 + Vite + Tailwind CSS + shadcn/ui, terminal aesthetic
-- **Runners** — `start.sh` / `stop.sh` one-command launch
 
-### Model layer (resilience)
-The LLM layer is provider-flexible and free-tier resilient:
+- **Backend** — FastAPI, Server-Sent Events, the Agno agent framework, and
+  Google Gemini via its native SDK (any OpenAI-compatible provider also
+  supported)
+- **Frontend** — React 19 + TypeScript + Vite + Tailwind CSS v4 + shadcn/ui,
+  terminal aesthetic
+- **Persistence** — SQLite server-side, `localStorage` client-side
+- **Runners** — `start.sh` / `stop.sh`
 
-- Model ids starting with `gemini` route through the native Gemini SDK
-  (`GEMINI_API_KEY`); anything else goes through any OpenAI-compatible endpoint
-  (`LLM_API_KEY` / `LLM_BASE_URL`).
-- **Round-robin across a model pool** — every request cycles across the primary
-  model plus `LLM_FALLBACK_MODELS`, so per-model free-tier quotas are spread
-  instead of exhausted.
-- **Transparent quota rotation** — a 429 marks that model as cooling down for its
-  provider-reported retry window and the request transparently retries on the
-  next model. Errors never surface to the user.
-- **Request pacing** — `GEMINI_MIN_REQUEST_INTERVAL` spaces requests globally.
-- **Stage-level retries + mid-stream restart** — transient failures (503 capacity
-  spikes) retry the whole stage; a failed report stream restarts generation and
-  emits a `reset` event so the client clears partial text instead of showing an
-  error.
+### Model layer
+
+- **Latency-aware selection.** Every call records time-to-first-token per model
+  and traffic is weighted by observed speed, not rotated blindly.
+- **Slow-model quarantine.** A model slower than 8s *and* 4× the fastest is
+  benched for five minutes.
+- **Lite models rank last** — speed must not silently buy a quality drop.
+- **Quota rotation** — a 429 benches that model and retries on another; errors
+  never surface to the user.
+- **Global pacing** — `GEMINI_MIN_REQUEST_INTERVAL`.
+- **Bounded retries** — two attempts, 2s apart, transient failures only.
 
 ### Streaming protocol (SSE)
-Both modes stream events over `POST`:
 
 | Event | Purpose |
 |-------|---------|
-| `status` | Progress label + detail (X-Ray) |
-| `stage_start` / `stage_done` | Pipeline stage transitions (Venture) |
+| `status` | Progress label + detail |
+| `stage_start` / `stage_done` | Report stage transitions |
 | `delta` | Incremental report Markdown |
-| `reset` | Client should clear accumulated report text (generation restarted) |
+| `reset` | Client clears accumulated text (generation restarted) |
+| `idea` | A completed Discovery opportunity card |
 | `done` / `error` | Terminal states |
 
 ### API
+
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /api/venture` | `{ "idea": string }` → 5-stage pipeline + streamed report |
-| `POST /api/analyze` | `{ "company", "analysis_type" }` → X-Ray team report |
+| `POST /api/venture` | `{ "idea" }` → streamed Venture Intelligence report |
+| `POST /api/analyze` | `{ "company", "analysis_type" }` → streamed Company X-Ray report |
+| `POST /api/discover` | `{ "focus"? }` → streamed opportunity cards |
 | `POST /api/ask` | `{ "content", "question" }` → streamed answer grounded in the report |
-| `POST /api/discover` | `{ "focus"? }` → streamed opportunity ideas |
+| `POST /api/auth/*` | Register, login, session, Google sign-in |
 | `POST /api/runs/sync` | Persist a completed chat exchange |
-| `GET /api/updates` | Server-originated exchanges since a timestamp (client polling) |
+| `GET /api/chats`, `DELETE /api/chats/{id}`, `PATCH /api/chats/{id}/pin` | Chat history management |
 | `GET/POST /api/watchlist`, `DELETE /api/watchlist/{id}` | Watch management |
-| `POST /api/digest/run` | Manual scheduler cycle (re-validations + digest) |
-| `GET /api/health` | Readiness, active model, agent roster, pipelines, autonomous features |
+| `GET/POST/DELETE /api/discover/scan` | Per-user discovery scan persistence |
+| `GET /api/updates` | Server-originated exchanges since a timestamp |
+| `POST /api/digest/run` | Manual scheduler cycle |
+| `GET /api/health` | Readiness, active model, analyst roster, features |
 
 ### Codebase map
+
 | Area | Files |
 |------|-------|
-| Agent engine | `backend/agents.py` — 8 pipeline/team agents + Critic, Monitor, Discovery, Q&A, Digest agents; prompts; pipeline runners; model rotation |
-| API server | `backend/main.py` — FastAPI, SSE endpoints, sync/watch/discover/ask/digest |
-| Persistence | `backend/store.py` — SQLite (runs, exchanges, watchlist, meta) |
-| Scheduler | `backend/scheduler.py` — background thread: due re-validations + digests |
-| App shell / routing | `frontend/src/App.tsx` |
-| Views | `landing.tsx`, `workspace.tsx`, `library.tsx`, `explore.tsx`, `discover.tsx`, `settings.tsx` |
-| Components | `sidebar.tsx` (collapsible, watch/digest badges), `pipeline-steps.tsx`, `status-steps.tsx`, `markdown.tsx`, `logo.tsx` |
-| Client | `frontend/src/lib/api.ts` (SSE reader + sync/watch/discover/ask clients), `frontend/src/lib/use-analyze.ts` (chat state, server sync, autonomous-update polling) |
-
-### Persistence
-Chats (report content, per-turn stages/modes, timestamps, pins) persist both to
-browser `localStorage` (up to 60 chats, instant load) and server-side SQLite
-(synced on completion) — the latter powering autonomous re-validation and
-digests. Individual reports can be deleted, pinned or watched.
-
----
-
-## 6. Venture Intelligence Report Format (final deliverable)
-
-```markdown
-# Venture Intelligence Report — {idea}
-## Executive Verdict
-Pursue / Pivot / Drop + probability-of-success score & band
-## 1. Idea Validation
-Problem evidence, demand signals, validation verdict & reasoning
-## 2. Market & Location Intelligence
-TAM/SAM/SOM table, customer segments, local context, pricing tolerance
-## 3. Competitive Landscape
-Competitor table (name, offering, pricing, strength, gap), white-space summary
-## 4. Risk & Success Assessment
-Scoring table, SWOT, risk register (risk / likelihood / impact / mitigation)
-## 5. Venture Plan & Roadmap
-Business model, startup costs (₦), funding options, GTM, 0–90-day &
-3–12-month roadmap, regulatory checklist, KPIs
-## Sources
-All URLs crawled or searched
-```
+| Intelligence layer | `backend/intelligence.py` — analyst rules, streaming, source collection, truncation guard |
+| Analyst prompts | `backend/agents.py` — the three feature prompts, model pool, Q&A / monitor / digest agents |
+| API server | `backend/main.py` — FastAPI, SSE endpoints, auth, sync, watch, discover |
+| Auth | `backend/auth.py` — bcrypt, JWT, Google OAuth |
+| Persistence | `backend/store.py` — SQLite (runs, exchanges, watchlist, scans) |
+| Scheduler | `backend/scheduler.py` — background thread: re-validations + digests |
+| App shell | `frontend/src/App.tsx` |
+| Views | `landing.tsx`, `workspace.tsx`, `library.tsx`, `explore.tsx`, `discover.tsx`, `settings.tsx`, `auth.tsx` |
+| Components | `sidebar.tsx`, `pipeline-steps.tsx`, `status-steps.tsx`, `markdown.tsx`, `logo.tsx` |
+| Client | `lib/api.ts` (SSE reader + typed clients), `lib/use-analyze.ts` (chat state, sync, polling), `lib/discover-store.ts` |
 
 ---
 
@@ -214,18 +256,77 @@ All URLs crawled or searched
 
 | Check | Result |
 |-------|--------|
-| Full venture run ("food processing in Jos", "laundry service in Jos") | 5/5 stages, ~10–12k-char report, zero surfaced errors |
-| Full X-Ray run (Paystack) | Complete report, zero surfaced errors |
-| Quota resilience | 11+ mid-run 429s absorbed transparently via model rotation |
-| Type check + lint | `tsc --noEmit` clean; lint warnings pre-existing only |
-| Health endpoint | Reports model, 8 agents, both pipelines, ready |
+| Venture Intelligence live run | 8–14s, ~5.5k chars, streamed, 3–5 real sources |
+| Company X-Ray live run (Paystack) | 6–10s, ~4.5k chars, streamed, 3–5 real sources |
+| Discovery live run | 5–10s, 4 ideas emitted progressively, 3–5 real sources |
+| Source integrity | Only real, deduplicated URLs; no model-generated links in any run |
+| Source relevance | Fintech → CBN + SEC; agriculture → FAO; health → WHO |
+| Search-backend outage | Report still streams; sources fall back to the curated tier |
+| Regression suites | 4 scripts, all passing, offline (stubbed agents, no quota) |
+| Type check | `tsc --noEmit` clean |
+| Latency benchmark | `scripts/bench_intelligence.py`, per-phase timing |
 
 ---
 
-## 8. Out of Scope (future roadmap)
+## 8. Future Enhancements / Future Autonomy
 
-- Email / push delivery of digests (in-app only for now)
-- User accounts, multi-session support
-- Interactive charts for market/risk sections
-- PDF/DOCX export of the report
-- Updating the academic write-up in `report/` (separate exercise)
+**None of the following is implemented.** These are the roadmap for making
+Thrace more autonomous and stronger as a product.
+
+### 8.1 Continuous and scheduled intelligence
+
+- **Continuous market monitoring** — track a venture's market, competitors and
+  demand signals continuously rather than validating once at a point in time
+- **Automatic trend detection** — identify emerging sectors and shifting
+  consumer behaviour without a user prompt
+- **Scheduled intelligence updates** — user-defined refresh cadences per idea,
+  company or watchlist entry, replacing the fixed weekly re-validation
+- **Automated competitor monitoring** — detect new entrants, pricing moves,
+  funding events and product launches for tracked companies
+- **Notification and alerting** — push or email alerts when a monitored signal
+  crosses a threshold, rather than requiring the user to open the app
+
+### 8.2 Memory and learning
+
+- **Persistent startup and idea memory** — retain the full analytical history of
+  an idea and track how its assessment evolves over time
+- **Learning from user feedback** — capture which recommendations users acted on
+  and which they dismissed, and use that signal to calibrate future output
+- **Personalised recommendations** — tailor opportunity discovery and analysis
+  depth to a user's sector, geography and stage
+
+### 8.3 Opportunity intelligence
+
+- **Opportunity scoring** — a transparent, weighted score per discovered
+  opportunity, comparable to the rubric the original pipeline applied to risk
+- **Validation-experiment design** — generate cheap, concrete falsification
+  tests automatically, including sample sizes and success thresholds
+- **Autonomous follow-up research** — trigger deeper retrieval automatically
+  where the fast pass found the evidence too thin, rather than either crawling
+  by default or never following up
+
+### 8.4 Trust and verification
+
+- **Stronger source verification** — validate that cited URLs resolve and
+  support the claim attributed to them, and score source quality
+- **Claim-level provenance** — attach evidence to individual claims rather than
+  to the report as a whole
+- **Recency weighting** — prefer recent sources for fast-moving markets
+
+### 8.5 Product surface
+
+- **Report export** to PDF, DOCX and CSV for submission to banks, investors and
+  grant programmes
+- **Team and shared workspaces** — collaborative reports and shared watchlists
+- **Public API** — let third-party tools request a report programmatically
+
+---
+
+## 9. Out of Scope
+
+Deliberately not part of the system, and not planned as described above:
+
+- Deep recursive crawling of company websites
+- A sequential multi-agent research pipeline on the normal request path
+- Academic citation graphs or inline `[1][2]` citation systems
+- Third-party job queues, vector databases, or microservice decomposition

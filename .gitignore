@@ -15,3 +15,8 @@ frontend/.vite/
 # runtime data
 backend/data/
 
+# stray working copy of the auth hero at the repo root.
+# Root-anchored on purpose: a bare name would also match the tracked
+# frontend/public/thracehero.webp sibling and silently untrack it.
+/thracehero.png
+

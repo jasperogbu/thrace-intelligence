@@ -1,351 +1,386 @@
 #!/usr/bin/env python3
-"""Render the Thrace project report chapters (Markdown) to DOCX and PDF."""
+"""Render the report chapters to .docx and .pdf.
+
+The formatting matches the previously generated report so the deliverable
+looks unchanged: US Letter, 1.25in side / 1in top-bottom margins, Times
+New Roman 12pt body, 16/14/12pt bold headings, Table Grid tables, and
+Courier New for code blocks.
+
+Markdown is rendered, not passed through: headings, paragraphs, bullets,
+numbered lists, fenced code, pipe tables and bold spans are all mapped to
+real Word paragraphs/tables so the output is editable.
+
+Usage:
+    python scripts/render_report.py
+"""
+from __future__ import annotations
+
+import os
 import re
 import sys
-from pathlib import Path
 
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from docx.shared import Inches, Pt, RGBColor
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    Preformatted, PageBreak,
-)
+REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "report")
+CHAPTERS = [
+    "01-introduction.md",
+    "02-literature-review.md",
+    "03-methodology.md",
+    "04-implementation-results.md",
+    "05-discussion.md",
+    "06-conclusion.md",
+]
+DOCX_OUT = os.path.join(REPORT_DIR, "Thrace_Final_Year_Project.docx")
+PDF_OUT = os.path.join(REPORT_DIR, "Thrace_Final_Year_Project.pdf")
 
-REPORT_DIR = Path(__file__).resolve().parent.parent / "report"
-CHAPTERS = [f"0{i}-" for i in range(1, 7)]
+BODY_FONT = "Times New Roman"
+MONO_FONT = "Courier New"
+BODY_SIZE = Pt(12)
 
 
 # ---------------------------------------------------------------------------
-# Markdown parsing (shared)
+# Markdown parsing
 # ---------------------------------------------------------------------------
-def parse_markdown(text):
-    """Parse chapter markdown into a list of block dicts."""
+INLINE_BOLD = re.compile(r"\*\*(.+?)\*\*")
+INLINE_CODE = re.compile(r"`([^`]+)`")
+
+
+def _add_runs(paragraph, text: str, base_size=BODY_SIZE, base_font=BODY_FONT):
+    """Write `text` into `paragraph`, honouring **bold** and `code` spans."""
+    # Split on the two inline markers in one pass so they can be interleaved.
+    pattern = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`")
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            paragraph.add_run(text[pos : m.start()]).font.size = base_size
+        if m.group(1) is not None:
+            run = paragraph.add_run(m.group(1))
+            run.bold = True
+            run.font.size = base_size
+        else:
+            run = paragraph.add_run(m.group(2))
+            run.font.name = MONO_FONT
+            run.font.size = Pt(10.5)
+        pos = m.end()
+    if pos < len(text):
+        paragraph.add_run(text[pos:]).font.size = base_size
+
+
+def _is_table_row(line: str) -> bool:
+    return line.strip().startswith("|") and line.strip().endswith("|")
+
+
+def _table_cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_separator(line: str) -> bool:
+    return bool(re.fullmatch(r"\|[\s:\-|]+\|?", line.strip()))
+
+
+def parse_markdown(text: str) -> list[tuple]:
+    """Flatten markdown into ('kind', payload) blocks.
+
+    Kinds: h1 h2 h3 h4 p bullet number code table caption blank
+    """
     lines = text.split("\n")
-    blocks = []
+    blocks: list[tuple] = []
     i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
+    while i < len(lines):
+        line = lines[i].rstrip()
+        stripped = line.strip()
 
-        if line.startswith("```"):
-            j = i + 1
-            code = []
-            while j < n and not lines[j].startswith("```"):
-                code.append(lines[j])
-                j += 1
-            blocks.append({"type": "code", "text": "\n".join(code)})
-            i = j + 1
+        if not stripped:
+            blocks.append(("blank", ""))
+            i += 1
             continue
 
-        m = re.match(r"^(#{1,4})\s+(.*)$", line)
+        # Fenced code
+        if stripped.startswith("```"):
+            i += 1
+            buf = []
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            i += 1  # closing fence
+            blocks.append(("code", "\n".join(buf)))
+            continue
+
+        # Headings
+        m = re.match(r"^(#{1,4})\s+(.*)$", stripped)
         if m:
-            blocks.append({"type": f"h{len(m.group(1))}", "text": m.group(2).strip()})
+            blocks.append((f"h{len(m.group(1))}", m.group(2).strip()))
             i += 1
             continue
 
-        if re.match(r"^\|.*\|$", line) and i + 1 < n and re.match(r"^\|[\s:|-]+\|$", lines[i + 1]):
-            header = [c.strip() for c in line.strip("|").split("|")]
+        # Table: header row followed by a separator row
+        if _is_table_row(stripped) and i + 1 < len(lines) and _is_separator(lines[i + 1]):
+            header = _table_cells(stripped)
+            i += 2
             rows = []
-            j = i + 2
-            while j < n and re.match(r"^\|.*\|$", lines[j]):
-                rows.append([c.strip() for c in lines[j].strip("|").split("|")])
-                j += 1
-            blocks.append({"type": "table", "header": header, "rows": rows})
-            i = j
-            continue
-
-        if re.match(r"^\s*[-*]\s+", line):
-            items = []
-            while i < n and re.match(r"^\s*[-*]\s+", lines[i]):
-                items.append(re.sub(r"^\s*[-*]\s+", "", lines[i]))
+            while i < len(lines) and _is_table_row(lines[i]):
+                rows.append(_table_cells(lines[i]))
                 i += 1
-            blocks.append({"type": "ul", "items": items})
+            blocks.append(("table", (header, rows)))
             continue
 
-        if re.match(r"^\s*\d+\.\s+", line):
+        # Bullets
+        if re.match(r"^[-*]\s+", stripped):
             items = []
-            while i < n and re.match(r"^\s*\d+\.\s+", lines[i]):
-                items.append(re.sub(r"^\s*\d+\.\s+", "", lines[i]))
+            while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
+                items.append(re.sub(r"^\s*[-*]\s+", "", lines[i]).strip())
                 i += 1
-            blocks.append({"type": "ol", "items": items})
+            blocks.append(("bullet", items))
             continue
 
-        if line.strip() == "":
-            i += 1
+        # Numbered list
+        if re.match(r"^\d+\.\s+", stripped):
+            items = []
+            while i < len(lines) and re.match(r"^\s*\d+\.\s+", lines[i]):
+                items.append(re.sub(r"^\s*\d+\.\s+", "", lines[i]).strip())
+                i += 1
+            blocks.append(("number", items))
             continue
 
-        # paragraph: consume until blank line or special block start
-        para = [line]
-        i += 1
-        while i < n and lines[i].strip() != "" and not (
-            lines[i].startswith(("#", "```"))
-            or re.match(r"^\s*[-*]\s+", lines[i])
-            or re.match(r"^\s*\d+\.\s+", lines[i])
-            or re.match(r"^\|.*\|$", lines[i])
-        ):
-            para.append(lines[i])
+        # Paragraph (consume until a blank line or the start of another block)
+        buf = []
+        while i < len(lines):
+            cur = lines[i].rstrip()
+            s = cur.strip()
+            if (
+                not s
+                or s.startswith("#")
+                or s.startswith("```")
+                or re.match(r"^\s*[-*]\s+", cur)
+                or re.match(r"^\s*\d+\.\s+", cur)
+                or _is_table_row(s)
+            ):
+                break
+            buf.append(s)
             i += 1
-        blocks.append({"type": "p", "text": " ".join(para)})
+        if buf:
+            blocks.append(("p", " ".join(buf)))
+        else:
+            i += 1
     return blocks
 
 
-def md_inline_to_xml(s):
-    """Markdown inline -> list of (text, bold, italic) tuples."""
-    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    tokens = re.split(r"(\*\*.*?\*\*|\*.*?\*)", s)
-    out = []
-    for t in tokens:
-        if not t:
-            continue
-        if t.startswith("**") and t.endswith("**"):
-            out.append((t[2:-2], True, False))
-        elif t.startswith("*") and t.endswith("*"):
-            out.append((t[1:-1], False, True))
-        else:
-            out.append((t, False, False))
-    return out
-
-
 # ---------------------------------------------------------------------------
-# DOCX builder
+# DOCX rendering
 # ---------------------------------------------------------------------------
-def build_docx(all_blocks, out_path):
+def build_docx(chapters: list[tuple[str, str]]) -> Document:
     doc = Document()
 
-    style = doc.styles["Normal"]
-    style.font.name = "Times New Roman"
-    style.font.size = Pt(12)
-    style.paragraph_format.line_spacing = 1.5
-    style.paragraph_format.space_after = Pt(6)
-    rpr = style.element.get_or_add_rPr()
-    rfonts = rpr.find(qn("w:rFonts"))
-    if rfonts is None:
-        rfonts = OxmlElement("w:rFonts")
-        rpr.append(rfonts)
-    rfonts.set(qn("w:eastAsia"), "Times New Roman")
+    section = doc.sections[0]
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.left_margin = Inches(1.25)
+    section.right_margin = Inches(1.25)
+    section.top_margin = Inches(1.0)
+    section.bottom_margin = Inches(1.0)
 
-    for name, size, bold, before, after, align in [
-        ("Heading 1", 16, True, 18, 12, WD_ALIGN_PARAGRAPH.CENTER),
-        ("Heading 2", 14, True, 16, 10, WD_ALIGN_PARAGRAPH.CENTER),
-        ("Heading 3", 12, True, 14, 8, WD_ALIGN_PARAGRAPH.LEFT),
-        ("Heading 4", 12, True, 12, 6, WD_ALIGN_PARAGRAPH.LEFT),
-    ]:
-        h = doc.styles[name]
-        h.font.name = "Times New Roman"
-        h.font.size = Pt(size)
-        h.font.bold = bold
-        h.font.color.rgb = RGBColor(0, 0, 0)
-        h.paragraph_format.space_before = Pt(before)
-        h.paragraph_format.space_after = Pt(after)
-        h.paragraph_format.alignment = align
+    styles = doc.styles
+    for name, size, bold in (
+        ("Normal", 12, False),
+        ("Heading 1", 16, True),
+        ("Heading 2", 14, True),
+        ("Heading 3", 12, True),
+        ("Heading 4", 12, True),
+    ):
+        st = styles[name]
+        st.font.name = BODY_FONT
+        st.font.size = Pt(size)
+        st.font.bold = bold
 
-    def add_runs(p, text):
-        for txt, bold, italic in md_inline_to_xml(text):
-            r = p.add_run(txt)
-            r.bold = bold
-            r.italic = italic
+    doc.add_paragraph().add_run()
+    for filename, text in chapters:
+        _render_blocks(doc, parse_markdown(text))
+    return doc
 
-    for chapter_blocks in all_blocks:
-        first_h2 = True
-        for b in chapter_blocks:
-            t = b["type"]
-            if t == "h1":
-                p = doc.add_paragraph(style="Heading 1")
-                add_runs(p, b["text"])
-            elif t == "h2":
-                if not first_h2:
-                    doc.add_page_break()
-                first_h2 = False
-                p = doc.add_paragraph(style="Heading 2")
-                add_runs(p, b["text"])
-            elif t == "h3":
-                p = doc.add_paragraph(style="Heading 3")
-                add_runs(p, b["text"])
-            elif t == "h4":
-                p = doc.add_paragraph(style="Heading 4")
-                add_runs(p, b["text"])
-            elif t == "p":
+
+def _render_blocks(doc: Document, blocks: list[tuple]) -> None:
+    for kind, payload in blocks:
+        if kind == "blank":
+            continue
+
+        if kind in ("h1", "h2", "h3", "h4"):
+            p = doc.add_heading(level=int(kind[1]))
+            _add_runs(p, payload, base_size=Pt(16 if kind == "h1" else 14 if kind == "h2" else 12))
+            continue
+
+        if kind == "p":
+            p = doc.add_paragraph()
+            _add_runs(p, payload)
+            continue
+
+        if kind == "bullet":
+            for item in payload:
+                p = doc.add_paragraph(style="List Bullet")
+                _add_runs(p, item)
+            continue
+
+        if kind == "number":
+            for item in payload:
+                p = doc.add_paragraph(style="List Number")
+                _add_runs(p, item)
+            continue
+
+        if kind == "code":
+            for line in payload.split("\n"):
                 p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                add_runs(p, b["text"])
-            elif t == "ul":
-                for item in b["items"]:
-                    p = doc.add_paragraph(style="List Bullet")
-                    add_runs(p, item)
-            elif t == "ol":
-                for item in b["items"]:
-                    p = doc.add_paragraph(style="List Number")
-                    add_runs(p, item)
-            elif t == "code":
-                for code_line in b["text"].split("\n"):
-                    p = doc.add_paragraph()
-                    r = p.add_run(code_line)
-                    r.font.name = "Courier New"
-                    r.font.size = Pt(8.5)
-                    rpr2 = r._element.get_or_add_rPr()
-                    rf2 = OxmlElement("w:rFonts")
-                    rf2.set(qn("w:ascii"), "Courier New")
-                    rf2.set(qn("w:hAnsi"), "Courier New")
-                    rpr2.append(rf2)
-                    p.paragraph_format.space_after = Pt(0)
-                    p.paragraph_format.line_spacing = 1.0
-            elif t == "table":
-                header, rows = b["header"], b["rows"]
-                table = doc.add_table(rows=1 + len(rows), cols=len(header))
-                table.style = "Table Grid"
-                table.alignment = WD_TABLE_ALIGNMENT.CENTER
-                for c, htxt in enumerate(header):
-                    cell = table.rows[0].cells[c]
-                    cell.text = ""
-                    p = cell.paragraphs[0]
-                    r = p.add_run(re.sub(r"\*\*?", "", htxt))
-                    r.bold = True
-                    r.font.size = Pt(10)
-                for rI, row in enumerate(rows):
-                    for c, val in enumerate(row):
-                        if c >= len(header):
-                            continue
-                        cell = table.rows[rI + 1].cells[c]
-                        cell.text = ""
-                        p = cell.paragraphs[0]
-                        add_runs(p, val)
-                        for r in p.runs:
-                            r.font.size = Pt(10)
-                doc.add_paragraph()
-    doc.save(out_path)
+                p.paragraph_format.space_after = Pt(0)
+                run = p.add_run(line if line else " ")
+                run.font.name = MONO_FONT
+                run.font.size = Pt(9)
+            doc.add_paragraph()
+            continue
+
+        if kind == "table":
+            header, rows = payload
+            table = doc.add_table(rows=1, cols=len(header))
+            table.style = "Table Grid"
+            for idx, cell_text in enumerate(header):
+                cell = table.rows[0].cells[idx]
+                cell.text = ""
+                para = cell.paragraphs[0]
+                run = para.add_run(cell_text)
+                run.bold = True
+                run.font.size = Pt(10.5)
+                run.font.name = BODY_FONT
+            for row in rows:
+                cells = table.add_row().cells
+                for idx, cell_text in enumerate(row[: len(header)]):
+                    cells[idx].text = ""
+                    para = cells[idx].paragraphs[0]
+                    _add_runs(para, cell_text, base_size=Pt(10.5))
+            doc.add_paragraph()
+            continue
 
 
 # ---------------------------------------------------------------------------
-# PDF builder
+# PDF rendering
 # ---------------------------------------------------------------------------
-def build_pdf(all_blocks, out_path):
-    styles = getSampleStyleSheet()
+def build_pdf(chapters: list[tuple[str, str]]) -> None:
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    sheet = getSampleStyleSheet()
     body = ParagraphStyle(
-        "Body", parent=styles["Normal"], fontName="Times-Roman",
-        fontSize=11, leading=16.5, alignment=TA_JUSTIFY, spaceAfter=8,
+        "Body",
+        parent=sheet["Normal"],
+        fontName="Times-Roman",
+        fontSize=11,
+        leading=15,
+        alignment=TA_LEFT,
+        spaceAfter=8,
     )
-    h1 = ParagraphStyle(
-        "H1x", parent=body, fontName="Times-Bold", fontSize=16,
-        leading=20, alignment=TA_CENTER, spaceBefore=10, spaceAfter=14,
-    )
-    h2 = ParagraphStyle(
-        "H2x", parent=body, fontName="Times-Bold", fontSize=14,
-        leading=18, alignment=TA_CENTER, spaceBefore=8, spaceAfter=12,
-    )
-    h3 = ParagraphStyle(
-        "H3x", parent=body, fontName="Times-Bold", fontSize=12,
-        leading=16, spaceBefore=12, spaceAfter=6,
-    )
-    h4 = ParagraphStyle("H4x", parent=h3, fontSize=11.5)
-    li = ParagraphStyle("LIx", parent=body, leftIndent=18, spaceAfter=4)
-    code = ParagraphStyle(
-        "Codex", fontName="Courier", fontSize=7.6, leading=9.5,
-        leftIndent=12, spaceAfter=8,
-    )
+    h1 = ParagraphStyle("H1", parent=body, fontName="Times-Bold", fontSize=15, spaceBefore=14, spaceAfter=8)
+    h2 = ParagraphStyle("H2", parent=body, fontName="Times-Bold", fontSize=13, spaceBefore=12, spaceAfter=6)
+    h3 = ParagraphStyle("H3", parent=body, fontName="Times-Bold", fontSize=11.5, spaceBefore=10, spaceAfter=5)
+    h4 = ParagraphStyle("H4", parent=body, fontName="Times-Bold", fontSize=11, spaceBefore=8, spaceAfter=4)
+    bullet = ParagraphStyle("Bullet", parent=body, leftIndent=16, bulletIndent=6, spaceAfter=3)
+    code = ParagraphStyle("Code", parent=body, fontName="Courier", fontSize=8, leading=10, spaceAfter=0)
+    cell = ParagraphStyle("Cell", parent=body, fontSize=9, leading=11, spaceAfter=0)
+    cellb = ParagraphStyle("CellB", parent=cell, fontName="Times-Bold")
 
-    def esc(s):
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def markup(text: str) -> str:
+        """Escape for reportlab and restore bold/code as reportlab tags."""
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = INLINE_CODE.sub(r'<font face="Courier">\1</font>', text)
+        text = INLINE_BOLD.sub(r"<b>\1</b>", text)
+        return text
 
-    def fmt(s):
-        s = esc(s)
-        s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
-        s = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<i>\1</i>", s)
-        return s
-
-    def add_footer(canvas, doc_):
-        canvas.saveState()
-        canvas.setFont("Times-Roman", 9)
-        canvas.drawCentredString(A4[0] / 2, 1.4 * cm, str(canvas.getPageNumber()))
-        canvas.restoreState()
-
-    story = []
-    for chapter_blocks in all_blocks:
-        first_h2 = True
-        for b in chapter_blocks:
-            t = b["type"]
-            if t == "h1":
-                story.append(Paragraph(fmt(b["text"]), h1))
-            elif t == "h2":
-                if not first_h2:
-                    story.append(PageBreak())
-                first_h2 = False
-                story.append(Paragraph(fmt(b["text"]), h2))
-            elif t == "h3":
-                story.append(Paragraph(fmt(b["text"]), h3))
-            elif t == "h4":
-                story.append(Paragraph(fmt(b["text"]), h4))
-            elif t == "p":
-                story.append(Paragraph(fmt(b["text"]), body))
-            elif t == "ul":
-                for item in b["items"]:
-                    story.append(Paragraph("•&nbsp;&nbsp;" + fmt(item), li))
-            elif t == "ol":
-                for k, item in enumerate(b["items"], 1):
-                    story.append(Paragraph(f"{k}.&nbsp;&nbsp;" + fmt(item), li))
-            elif t == "code":
-                txt = b["text"]
-                if txt.strip():
-                    story.append(Preformatted(txt, code))
-            elif t == "table":
-                header, rows = b["header"], b["rows"]
-                data = [[Paragraph("<b>" + fmt(h) + "</b>", body) for h in header]]
-                for row in rows:
-                    data.append([Paragraph(fmt(v), body) for v in row[: len(header)]])
-                avail = A4[0] - 3 * cm
-                ncols = max(1, len(header))
-                widths = [avail / ncols] * ncols
-                tbl = Table(data, colWidths=widths, repeatRows=1)
-                tbl.setStyle(TableStyle([
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.Color(0.92, 0.92, 0.92)),
+    def table_flow(header, rows):
+        data = [[Paragraph(markup(c), cellb) for c in header]]
+        for row in rows:
+            data.append([Paragraph(markup(c), cell) for c in row[: len(header)]])
+        tbl = Table(data, repeatRows=1)
+        tbl.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.5, (0.4, 0.4, 0.4)),
+                    ("BACKGROUND", (0, 0), (-1, 0), (0.93, 0.93, 0.93)),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
-                    ("TOPPADDING", (0, 0), (-1, -1), 3),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ]))
-                story.append(tbl)
-                story.append(Spacer(1, 8))
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ]
+            )
+        )
+        return tbl
 
-    docpdf = SimpleDocTemplate(
-        str(out_path), pagesize=A4,
-        leftMargin=2.54 * cm, rightMargin=2.54 * cm,
-        topMargin=2.54 * cm, bottomMargin=2.54 * cm,
-        title="Thrace Final Year Project Report",
+    doc = SimpleDocTemplate(
+        PDF_OUT,
+        pagesize=LETTER,
+        leftMargin=1.25 * inch,
+        rightMargin=1.25 * inch,
+        topMargin=1.0 * inch,
+        bottomMargin=1.0 * inch,
+        title="Thrace — Final Year Project Report",
         author="Thrace",
     )
-    docpdf.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
+
+    story = []
+    for idx, (_filename, text) in enumerate(chapters):
+        if idx:
+            story.append(PageBreak())
+        for kind, payload in parse_markdown(text):
+            if kind == "blank":
+                continue
+            if kind == "h1":
+                story.append(Paragraph(markup(payload), h1))
+            elif kind == "h2":
+                story.append(Paragraph(markup(payload), h2))
+            elif kind in ("h3", "h4"):
+                story.append(Paragraph(markup(payload), h3 if kind == "h3" else h4))
+            elif kind == "p":
+                story.append(Paragraph(markup(payload), body))
+            elif kind == "bullet":
+                for item in payload:
+                    story.append(Paragraph(markup(item), bullet, bulletText="•"))
+            elif kind == "number":
+                for n, item in enumerate(payload, 1):
+                    story.append(Paragraph(markup(item), bullet, bulletText=f"{n}."))
+            elif kind == "code":
+                for line in payload.split("\n"):
+                    story.append(Paragraph(markup(line) or "&nbsp;", code))
+                story.append(Spacer(1, 8))
+            elif kind == "table":
+                header, rows = payload
+                story.append(table_flow(header, rows))
+                story.append(Spacer(1, 8))
+
+    doc.build(story)
 
 
-# ---------------------------------------------------------------------------
-def main():
-    files = sorted(p for p in REPORT_DIR.glob("*.md") if p.name[:3] in CHAPTERS)
-    if not files:
-        print("no chapter files found", file=sys.stderr)
-        sys.exit(1)
+def main() -> int:
+    chapters: list[tuple[str, str]] = []
+    for name in CHAPTERS:
+        path = os.path.join(REPORT_DIR, name)
+        if not os.path.isfile(path):
+            print(f"missing chapter: {name}", file=sys.stderr)
+            return 1
+        with open(path, encoding="utf-8") as fh:
+            chapters.append((name, fh.read()))
 
-    all_blocks = []
-    for f in files:
-        text = f.read_text(encoding="utf-8")
-        all_blocks.append(parse_markdown(text))
-        print(f"parsed {f.name}")
+    build_docx(chapters).save(DOCX_OUT)
+    build_pdf(chapters)
 
-    docx_path = REPORT_DIR / "Thrace_Final_Year_Project.docx"
-    pdf_path = REPORT_DIR / "Thrace_Final_Year_Project.pdf"
-    build_docx(all_blocks, docx_path)
-    print(f"wrote {docx_path}")
-    build_pdf(all_blocks, pdf_path)
-    print(f"wrote {pdf_path}")
+    for path in (DOCX_OUT, PDF_OUT):
+        print(f"  {os.path.basename(path):<40} {os.path.getsize(path) / 1024:.0f} KB")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
