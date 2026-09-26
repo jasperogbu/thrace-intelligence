@@ -80,8 +80,10 @@ A single analyst writes a structured report in one pass:
 | Recommended Next Steps | 3 actionable items |
 | Sources | 3–5 real, clickable links |
 
-Reports target 900–1300 words and are capped at 1300 output tokens. Any
-section can be taken deeper with a follow-up question.
+Reports run to roughly 1,000–2,300 words depending on the idea, and the
+output ceiling is set above that so a report always finishes rather than
+stopping mid-sentence. Any section can be taken deeper with a follow-up
+question.
 
 ### Company X-Ray
 
@@ -169,9 +171,13 @@ endpoint (`LLM_API_KEY` / `LLM_BASE_URL`).
 - **Quota rotation.** A 429 benches that model for its reported retry
   window and the request transparently retries on another.
 - **Global pacing.** `GEMINI_MIN_REQUEST_INTERVAL` spaces requests.
-- **Per-feature output ceilings.** Venture 1300, X-ray 1000, Discovery
-  900, Q&A 500 tokens. Dense markdown tokenises at roughly 4–6 characters
-  per token, so these are tuned to *complete*, not to truncate.
+- **Per-feature output ceilings.** Venture 2900, X-ray 1400, Discovery
+  1250, Q&A 700 tokens. Each sits above the length the model actually
+  chooses for that feature — measured at roughly 1,600–2,300 tokens for a
+  venture report, 1,050 for an X-ray and 890 for a scan — so a report is
+  never cut off part-way. The ceiling is not what makes a report concise:
+  a cap set below the natural length does not shorten it, it removes the
+  end. Dense markdown tokenises at roughly 4–6 characters per token.
 - **Thinking level.** Gemini 3.x reasons before it answers; the level is
   set to `low`, which removes several seconds of pre-answer latency.
 
@@ -184,9 +190,14 @@ separately. Figures are from the Gemini free tier and vary with model load.
 
 | Feature | Time to first token | Total | Output | Sources |
 |---------|--------------------|-------|--------|---------|
-| Venture Intelligence | 2–8s | 8–14s | ~5.5k chars | 3–5 |
-| Company X-Ray | 2–8s | 6–10s | ~4.5k chars | 3–5 |
-| Discovery | 2–6s | 5–10s | ~3.4k chars, 4 ideas | 3–5 |
+| Venture Intelligence | 2–8s | 11–13s | ~6.3–9.2k chars | 3–5 |
+| Company X-Ray | 2–8s | 9–10s | ~4.2k chars | 3–5 |
+| Discovery | 2–6s | 5–10s | ~3.5k chars, 4 ideas | 3–5 |
+
+The first request after a cold start is much slower — a measured 62s on a
+freshly started process, against 11–13s once the model pool has been measured
+and the fast models are known. Report length varies with the idea, which is
+why venture output is a range.
 
 > The Gemini free tier permits 20 requests per day per model. Sustained
 > benchmarking exhausts it; failures during measurement are that quota, not

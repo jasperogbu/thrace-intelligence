@@ -26,8 +26,12 @@ from __future__ import annotations
 
 import os
 import re
+import ssl
 import threading
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from textwrap import dedent
 from typing import Callable, Iterator
 
@@ -168,7 +172,7 @@ _LABEL_MAX_CHARS = 90
 _LAST_CHARS = 240
 
 
-def looks_truncated(text: str) -> bool:
+def looks_truncated(text: str, min_chars: int = 0) -> bool:
     """True when `text` appears to have been cut off mid-sentence.
 
     Only a heuristic, and deliberately biased towards not firing. Markdown
@@ -180,10 +184,23 @@ def looks_truncated(text: str) -> bool:
 
     Empty text is not truncation; that is the empty-report case, handled
     separately by the caller.
+
+    `min_chars` lets a caller who knows how long its own output should be catch
+    a stub that the tail heuristic cannot. A report cut after 200 characters
+    can end on a line that trips the deliberate-fragment exemption below: a real
+    one ended on "* **High-Yield Niche:** Abuja's decentralized geography and
+    high", which is 66 characters, starts with "*", and therefore looked like a
+    short label and was reported complete. Length settles that case, but only
+    the caller knows the floor, and only for its own feature — a 46-character
+    sentence that ends properly is not a truncated report, so the default is no
+    length opinion at all.
     """
     tail = (text or "").rstrip()
     if not tail:
         return False
+
+    if min_chars and len(tail) < min_chars:
+        return True
 
     last_line = tail.rsplit("\n", 1)[-1].strip()
     if not last_line:
@@ -269,6 +286,24 @@ SOURCE_BUDGET_SECONDS = float(os.getenv("SOURCE_BUDGET_SECONDS", "6"))
 # Firecrawl is optional infrastructure. With no key (or no credits left on the
 # key) we skip live search entirely and fall back to the curated set.
 MAX_LIVE_QUERIES = int(os.getenv("MAX_SOURCE_QUERIES", "2"))
+# Verifying that a cited link resolves is a background nicety, never something
+# the reader waits on: a couple of seconds, in parallel, off the request path,
+# and whatever has not answered by then is simply kept unverified.
+LINK_CHECK_SECONDS = float(os.getenv("LINK_CHECK_SECONDS", "3"))
+_USER_AGENT = os.getenv(
+    "LINK_CHECK_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+)
+# Hosts whose links are demoted to the end of the Sources list. They are real
+# and sometimes the only source of a fact, so they are ranked down, never
+# banned.
+_SOCIAL_HOSTS = (
+    "facebook.com", "fb.com", "instagram.com", "twitter.com", "x.com",
+    "tiktok.com", "threads.net", "threads.com", "pinterest.", "snapchat.com",
+    "reddit.com", "linkedin.com", "quora.com", "tiktok.com", "vk.com",
+    "telegram.me", "t.me", "medium.com",
+)
 
 # Official bodies whose root domains are stable and well known. These are a
 # *floor*, not a substitute for live search: they are only offered when live
@@ -410,17 +445,140 @@ def _extract_sources(markdown: str) -> list[dict]:
     return out
 
 
+# Path words that are site navigation rather than page content. A label built
+# from one of these tells the reader nothing, which is how a real report ended
+# up citing "gocaby — services" and "instagram — reel".
+_PATH_NOISE = frozenset({
+    "p", "r", "s", "u", "in", "en", "us", "uk", "eu", "ng", "index", "home",
+    "about", "contact", "privacy", "terms", "legal", "careers", "faq",
+    "faqs", "help", "support", "search", "share", "amp", "html", "php",
+    "aspx", "jsp", "wiki", "wikipedia", "reel", "reels", "post", "posts",
+    "blog", "blogs", "news", "newsroom", "article", "articles", "page",
+    "pages", "story", "stories", "video", "videos", "watch", "media",
+    "press", "category", "categories", "tag", "tags", "topic", "topics",
+    "resource", "resources", "service", "services", "solution", "solutions",
+    "product", "products", "insight", "insights", "2023", "2024", "2025",
+    "2026",
+})
+
+# Multi-label public suffixes have to be tested before single ones, or
+# "cbn.gov.ng" loses only ".ng" and the site is labelled "Cbn.gov".
+_MULTI_SUFFIXES = (
+    ".com.ng", ".org.ng", ".gov.ng", ".edu.ng", ".net.ng", ".co.uk",
+    ".com.gh", ".co.za", ".com.au", ".co.in",
+)
+_SINGLE_SUFFIXES = (
+    ".com", ".co", ".io", ".org", ".net", ".gov", ".edu", ".ng", ".uk",
+    ".us", ".za", ".gh", ".ke", ".ca", ".de", ".fr", ".ai",
+)
+# Locale subdomains, including the Nigerian languages, so "en.wikipedia.org"
+# reads as "Wikipedia" rather than "En Wikipedia".
+_LOCALE_PREFIXES = (
+    "en", "fr", "de", "es", "it", "pt", "nl", "ru", "ar", "zh", "ja", "ko",
+    "sw", "ha", "yo", "ig",
+)
+
+
+def _site_name(host: str) -> str:
+    """Turn a hostname into a readable site name: cbn.gov.ng -> Cbn."""
+    host = (host or "").split(":")[0].lower().strip(".")
+    for suffix in _MULTI_SUFFIXES + _SINGLE_SUFFIXES:
+        if host.endswith(suffix) and len(host) > len(suffix):
+            host = host[: -len(suffix)]
+            break
+    head, _, first = host.partition(".")
+    if first and head in _LOCALE_PREFIXES:
+        host = first
+    # Anything still dotted is an unlisted public suffix, or a subdomain
+    # ("news.bbc"). A trailing label of three characters or fewer is a
+    # suffix, so drop it and keep the name.
+    if "." in host:
+        base, _, suffix = host.rpartition(".")
+        if base and len(suffix) <= 3:
+            host = base
+    for suffix in (".gov", ".edu"):
+        if host.endswith(suffix):
+            host = host[: -len(suffix)]
+            break
+    host = host.replace("-", " ").replace("_", " ").strip()
+    return _humanise(host.split()) if host else ""
+
+
+def _is_opaque(segment: str) -> bool:
+    """True for path words that identify a resource but say nothing about it.
+
+    Page ids, hashes and social handles all look like words to a splitter, so
+    they have to be recognised deliberately or they end up in the label:
+    Instagram's reel id (DSCIZ2LjWY4), a LinkedIn vanity slug ending in a hash
+    (max-ng-1b1a4b58) and a Facebook page handle (Justbezilogistics01) are all
+    meaningless to a reader.
+    """
+    if segment.isdigit():
+        return True
+    digits = sum(ch.isdigit() for ch in segment)
+    if digits and (digits >= 2 or any(ch.isupper() for ch in segment) or len(segment) > 10):
+        return True  # an id, a hash, or a handle with a numeric tail
+    if not set(segment.lower()) & set("aeiou"):
+        return True  # no vowel: a code or a truncated hash
+    return False
+
+
+def _humanise(words: list[str]) -> str:
+    """Title-case a slug's words, leaving connectives lowercase."""
+    small = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of",
+             "on", "or", "the", "to", "with"}
+    out: list[str] = []
+    for i, word in enumerate(words):
+        low = word.lower()
+        if i and low in small:
+            out.append(low)
+        else:
+            out.append(low[:1].upper() + low[1:])
+    return " ".join(out)
+
+
 def _label_from(url: str) -> str:
-    """Derive a readable label from a URL's host and first path segment."""
+    """Derive a readable label from a URL.
+
+    The site name is the reliable part; the path is only worth showing when it
+    actually describes the page. The previous rule took the first path segment
+    unconditionally, which is site *navigation* far more often than it is
+    content — it produced "instagram — reel", "penglogistics — p" and
+    "gocaby — services", labels that carry no information and read as a bug
+    next to real titles.
+
+    So the path is filtered: navigation words and opaque ids are dropped, and
+    what survives is used only if it is short enough to read as a title.
+    Otherwise the site name stands alone, which is always honest.
+    """
     try:
-        trimmed = re.sub(r"^https?://(www\.)?", "", url)
+        trimmed = re.sub(r"^https?://(www\.)?", "", (url or "").strip())
+        trimmed = trimmed.split("#", 1)[0].split("?", 1)[0]
+        if not trimmed:
+            return url or ""
         parts = [p for p in trimmed.split("/") if p]
         if not parts:
             return url
-        host = parts[0].split(":")[0].replace("-", " ").replace(".com", "")
-        if len(parts) > 1 and parts[1] not in ("index.html", "index.htm"):
-            return f"{host} — {parts[1][:48]}"
-        return host
+
+        site = _site_name(parts[0])
+        if not site:
+            return url
+
+        kept: list[str] = []
+        for segment in parts[1:]:
+            segment = re.sub(r"\.(html?|php|aspx?|jsp)$", "", segment, flags=re.I)
+            words = [w for w in re.split(r"[-_+]", segment) if w]
+            words = [
+                w for w in words
+                if w.lower() not in _PATH_NOISE and not _is_opaque(w)
+            ]
+            kept.extend(words)
+            if len(kept) > 4:  # a marketing path, not a title
+                return site
+
+        if not kept:
+            return site
+        return f"{site} — {_humanise(kept[:4])}"
     except Exception:  # noqa: BLE001
         return url
 
@@ -484,6 +642,120 @@ def _live_search(query: str, limit: int) -> list[dict]:
     return _extract_sources(raw if isinstance(raw, str) else "")
 
 
+def _social_rank(url: str) -> int:
+    """1 for a social-media post, 0 for everything else.
+
+    A Facebook page or an Instagram reel is a weak citation for a claim about a
+    company or a market, and search engines rank them highly because they are
+    engagement surfaces, not authorities. They stay eligible — a page can be
+    the only source of a fact — but they are cited last.
+    """
+    host = re.sub(r"^https?://(www\.)?", "", (url or "")).split("/")[0].lower()
+    return 1 if any(s in host for s in _SOCIAL_HOSTS) else 0
+
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """A TLS context that can actually verify a certificate.
+
+    `ssl.create_default_context()` calls `load_default_certs()`, and on a
+    Python whose OpenSSL cannot see the system trust store that yields *zero*
+    CA certificates — measured on the interpreter this was written against.
+    Every request then fails with CERTIFICATE_VERIFY_FAILED, and a link checker
+    that fails every request reports nothing while appearing to work. So the
+    certifi bundle is loaded explicitly when it is available, and the default
+    store is only a fallback.
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        context = ssl.create_default_context()
+        try:
+            import certifi
+
+            context.load_verify_locations(cafile=certifi.where())
+        except Exception:  # noqa: BLE001 - fall back to the default store
+            try:
+                context.load_default_certs()
+            except Exception:  # noqa: BLE001
+                pass
+        _SSL_CONTEXT = context
+    return _SSL_CONTEXT
+
+
+def _http_status(url: str, timeout: float) -> int | None:
+    """Status code for `url`, or None when it could not be determined.
+
+    HEAD first because it transfers nothing. A fair number of servers answer
+    HEAD with 405, and some refuse it outright, so those fall back to a GET
+    that is abandoned after the first bytes.
+    """
+    headers = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
+    request = urllib.request.Request(url, method="HEAD", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        if exc.code != 405:
+            return exc.code
+    except Exception:  # noqa: BLE001 - fall through to the GET attempt
+        pass
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+            response.read(1)
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _verified(candidates: list[dict], timeout: float = LINK_CHECK_SECONDS) -> list[dict]:
+    """Drop links that are provably gone, then rank social posts last.
+
+    Only 404 and 410 are treated as dead. A 400 or 403 usually means the
+    server is refusing an automated request rather than that the page is
+    missing — Facebook answers 400 to everything — and discarding those would
+    throw away real pages. An unreachable host is likewise kept: a timeout is
+    not evidence of absence, and silently dropping links on a flaky network
+    would empty the Sources block. `add()` dedups and the tiers below top up,
+    so a shorter list is always repaired.
+    """
+    if not candidates:
+        return []
+
+    def check(src: dict) -> tuple[dict, int | None]:
+        return src, _http_status(src["url"], timeout)
+
+    statuses: list[int | None] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
+        for _, status in pool.map(check, candidates):
+            statuses.append(status)
+
+    resolved: list[tuple[dict, int | None]] = []
+    dropped: list[str] = []
+    for src, status in zip(candidates, statuses):
+        if status in (404, 410):
+            dropped.append(src["url"])
+        else:
+            resolved.append((src, status))
+    if dropped:
+        print(
+            f"[thrace] dropped {len(dropped)} dead source link(s): "
+            f"{', '.join(u[:60] for u in dropped[:3])}",
+            flush=True,
+        )
+    # A link we could not confirm — blocked, TLS-broken, or slow to answer —
+    # is kept, because absence of evidence is not evidence of absence. It is
+    # cited after everything we did confirm, though: a verified page is
+    # strictly better evidence than one we never managed to load.
+    resolved.sort(key=lambda pair: (_social_rank(pair[0]["url"]), pair[1] is None))
+    return [src for src, _ in resolved]
+
+
 class SourceCollector:
     """Fetch sources on a background thread so the report never waits for them.
 
@@ -540,14 +812,28 @@ class SourceCollector:
         if len(base) > 8:
             queries.append(f"{base} market size report")
 
+        candidates: list[dict] = []
+        candidate_seen: set[str] = set()
         for query in queries[:MAX_LIVE_QUERIES]:
             try:
                 for src in _live_search(query, limit=3):
-                    add(src["label"], src["url"])
+                    if src["url"] in candidate_seen:
+                        continue
+                    candidate_seen.add(src["url"])
+                    candidates.append(src)
             except Exception as exc:  # noqa: BLE001
                 # A dead search backend is expected and survivable.
                 print(f"[thrace] source retrieval failed: {str(exc)[:160]}", flush=True)
                 break
+
+        # Search results are only as good as their links. A provider happily
+        # returns slugs that 404 — gocaby.com/services/last-mile was cited by a
+        # live report and does not exist — and a dead link in a Sources block
+        # contradicts the one promise that block makes. Verify before citing,
+        # then order so that a company's own page outranks a social post about
+        # it, which is what a reader expects a "Sources" list to be.
+        for src in _verified(candidates):
+            add(src["label"], src["url"])
 
         # 2. Curated official bodies, most relevant first. Fills up to
         #    TARGET_SOURCES so a well-matched query gets more than the bare

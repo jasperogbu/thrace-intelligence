@@ -511,18 +511,51 @@ class _PacedGemini(Gemini):
 # that bounds a runaway completion — a model that ignores "be concise" will
 # otherwise stream until it exhausts its own limit.
 #
-# These ceilings are tuned to COMPLETE, not to truncate. Dense markdown
-# (tables and pipes) tokenises at roughly 4-6 characters per token on this
-# model, and an earlier 900-token venture cap cut the report off mid-sentence
-# in "Business Model" — which reads as a broken product, not a concise one.
-# `_ensure_complete` catches that case explicitly.
+# These ceilings are ceilings, not targets: the model's own sense of how long
+# the answer should be decides the length, and the cap only has to be high
+# enough to let it finish. It is NOT a knob for making reports concise — a cap
+# below the natural length does not produce a shorter report, it produces a
+# report with the last third lopped off, which reads as a broken product.
+#
+# Measured, not guessed. Running each feature with the cap lifted until nothing
+# truncated, and reading the length the model actually chose:
+#
+#   feature    natural output        old cap   verdict
+#   venture    ~8,600 chars ~2,150t   1,300     truncated ~42% of the report
+#   xray       ~3,600 chars   ~900t   1,000     fit, but with almost no margin
+#   discovery  ~3,550 chars   ~890t     900     fit by a handful of tokens
+#
+# So venture was not "concise", it was amputated: a report cut at 1,300 tokens
+# ends mid-sentence around "Rider Utilization Rate (the number of completed
+# paid deliveries per", and the Sources block that follows makes it look
+# deliberate. Each cap below is the measured natural length plus roughly a third
+# of headroom, which absorbs run-to-run variance without inviting essays.
 _MAX_TOKENS = {
-    "venture": int(os.getenv("VENTURE_MAX_TOKENS", "1300")),
-    "xray": int(os.getenv("XRAY_MAX_TOKENS", "1000")),
-    "discover": int(os.getenv("DISCOVERY_MAX_TOKENS", "900")),
-    "qa": int(os.getenv("QA_MAX_TOKENS", "500")),
+    "venture": int(os.getenv("VENTURE_MAX_TOKENS", "2900")),
+    "xray": int(os.getenv("XRAY_MAX_TOKENS", "1400")),
+    "discover": int(os.getenv("DISCOVERY_MAX_TOKENS", "1250")),
+    "qa": int(os.getenv("QA_MAX_TOKENS", "700")),
 }
 _DEFAULT_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1800"))
+
+# Shortest plausible finished output per feature, used to catch a stub that the
+# tail heuristic cannot. Measured natural lengths are ~7,100-9,000 characters
+# for venture, ~3,600 for x-ray and ~3,550 for discovery, so these floors sit
+# well below the real thing: they exist to catch a report that stopped after a
+# couple of hundred characters, not to police length.
+#
+# The tail heuristic alone misses that case. A real 204-character report ended
+# on "* **High-Yield Niche:** Abuja's decentralized geography and high" — 66
+# characters, starting with a bullet, so it read as a deliberate short label
+# and was reported complete. Only the caller knows its own floor, which is why
+# this lives here rather than inside the detector.
+_MIN_REPORT_CHARS = {
+    "venture": 2500,
+    "xray": 1500,
+    "discover": 1500,
+    # Follow-up answers are meant to be short, so only a near-empty one counts.
+    "qa": 200,
+}
 
 
 def _max_tokens(kind: str) -> int:
@@ -998,7 +1031,9 @@ def instant_venture_prompt(idea: str) -> str:
         3 bullets, actionable this week.
 
         === RULES ===
-        - Target 900-1300 words TOTAL. Hard ceiling 1500.
+        - Target 900-1300 words TOTAL. Stay inside that; the token ceiling
+          that actually stops generation is set well above it, so running over
+          means the report really is too long.
         - Bullets over paragraphs. Tables only where a table is the clearer form.
         - Never repeat a point in two sections.
         - No preamble, no "in this report I will", no closing summary — the
@@ -1071,7 +1106,8 @@ def instant_xray_prompt(analysis_type: str, company: str) -> str:
         {body}
 
         === RULES ===
-        - Target 500-800 words TOTAL. Hard ceiling 1000.
+        - Target 500-800 words TOTAL. The token ceiling that stops generation
+          is set above that, so this is the budget that governs length.
         - Bullets, one line each where possible. No long paragraphs.
         - Never repeat a point across sections.
         - No preamble and no closing summary.
@@ -1096,8 +1132,11 @@ def _stream_instant(
     We do not try to patch that with a second call: the client has no way to
     replace the tail of a report it has already streamed, so a continuation
     would be appended after the dangling clause and read as garbled text.
-    Instead the cap is set high enough to complete (see `_MAX_TOKENS`) and a
-    truncation is logged so it stays visible rather than silent.
+    Instead the cap is set above the length the model actually writes (see
+    `_MAX_TOKENS`), and truncation is detected two ways — the tail heuristic in
+    `intelligence.looks_truncated`, plus the per-feature floor in
+    `_MIN_REPORT_CHARS`, which catches a report that stopped far too early to
+    be judged by its ending at all.
     """
     collector = (
         intelligence.SourceCollector(sources_query).start() if sources_query else None
@@ -1118,7 +1157,9 @@ def _stream_instant(
             "The report came back empty. Please try again — this is usually a "
             "transient provider issue."
         )
-    if intelligence.looks_truncated(body):
+    if intelligence.looks_truncated(
+        body, min_chars=_MIN_REPORT_CHARS.get(kind, 0)
+    ):
         print(
             f"[thrace] {kind} report hit the {_max_tokens(kind)}-token cap and "
             f"ends mid-sentence ({len(body)} chars); raise "

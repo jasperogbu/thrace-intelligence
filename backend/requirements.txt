@@ -9,3 +9,7 @@ bcrypt
 pyjwt
 httpx
 libsql-experimental
+# Source links are verified before they are cited. That check uses the stdlib
+# TLS stack, whose default trust store is empty on some Python builds, so the
+# CA bundle is named explicitly instead of being inherited transitively.
+certifi

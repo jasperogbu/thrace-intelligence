@@ -316,9 +316,15 @@ separately. Figures are from the Gemini free tier and vary with model load.
 
 | Feature | Time to first token | Total | Output | Sources |
 |---------|--------------------|-------|--------|---------|
-| Venture Intelligence | 2–8s | 8–14s | ~5.5k chars | 3–5 |
-| Company X-Ray | 2–8s | 6–10s | ~4.5k chars | 3–5 |
-| Discovery | 2–6s | 5–10s | ~3.4k chars | 3–5 |
+| Venture Intelligence | 2–8s | 11–13s | ~6.3–9.2k chars | 3–5 |
+| Company X-Ray | 2–8s | 9–10s | ~4.2k chars | 3–5 |
+| Discovery | 2–6s | 5–10s | ~3.5k chars | 3–5 |
+
+Length is set by the model's own judgement and varies with the subject, which
+is why venture output is a range. The first request against a freshly started
+process measured 62s against 11–13s once the pool had been measured: with no
+latency history, selection cannot yet tell the fast models from the slow ones
+and probes more of the pool before settling.
 
 The reduction is attributable to three changes, in order of measured impact:
 latency-aware model selection, which removed the routing of a predictable
@@ -344,11 +350,13 @@ seconds of pre-answer latency.
 | Discovery streaming | `POST /api/discover` over SSE | Passed — 4 `idea` events emitted progressively |
 | Source count and integrity | 14 query types × 3 backend conditions | Passed — 3–5 deduplicated real links in every case |
 | Source relevance | Asserted per sector | Passed — fintech→CBN, agriculture→FAO, health→WHO |
+| Source link verification | Live links plus stubbed 200/403/404/410/unreachable | Passed — 404 and 410 dropped, 403 and unreachable kept, unconfirmed cited last, social demoted |
+| Source label quality | 7 real URLs from a live run | Passed — no id, handle, query string or domain suffix leaks into a label |
 | Search-backend outage | Simulated retrieval failure | Passed — report streamed, no fabricated Sources block |
 | Empty report handling | Stubbed silent agent | Passed — raises rather than closing a blank report |
 | Retry classification | Auth, bad-request, capacity and quota inputs | Passed — permanent errors not retried, transient ones are |
 | Model selection | Simulated pool with known latencies | Passed — slow model receives a minimal share; quarantined model receives none |
-| Truncation detection | Markdown/prose cases | Passed — detects cut prose, ignores structural endings |
+| Truncation detection | Markdown/prose cases, plus a 110-character stub | Passed — detects cut prose, ignores structural endings, and a stub is caught by the caller's length floor |
 | Password reset | Live end-to-end | Passed — single use, expiry enforced, no user enumeration, old password rejected |
 | Regression suites | 3 offline scripts | Passed — no provider quota consumed |
 | Live probe | `test_venture.py` against a running server | Passed — 54 delta events, report generated, no errors |

@@ -86,9 +86,9 @@ optional background sources**.
 | **Subject** | A new business idea | An existing company | A region, sector or question |
 | **Output** | Structured validation report | Structured company analysis | 4 opportunity cards |
 | **Tools** | none | none | none |
-| **Output cap** | 1300 tokens | 1000 tokens | 900 tokens |
+| **Output cap** | 2900 tokens | 1400 tokens | 1250 tokens |
 | **Sources** | 3–5 real links | 3–5 real links | 3–5 real links |
-| **Measured total** | 8–14s | 6–10s | 5–10s |
+| **Measured total** | 11–13s | 9–10s | 5–10s |
 
 ### 4.1 Venture Intelligence
 

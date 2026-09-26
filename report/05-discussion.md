@@ -144,11 +144,13 @@ than one.
 ### 5.4 Strengths of the System
 
 - **Response time appropriate to the task.** A complete, structured report in
-  8–14 seconds changes what a founder can do with the tool: several ideas can
+  11–13 seconds changes what a founder can do with the tool: several ideas can
   be compared in one sitting, which is the workflow the product is for.
 - **Source integrity as a structural guarantee.** Not a prompt instruction but
   an architectural property, verified by automated test under three backend
-  conditions.
+  conditions. Links are checked before they are cited, so a slug that no
+  longer resolves cannot reach a reader, and unconfirmable links are ranked
+  below confirmed ones rather than silently treated as good or as bad.
 - **Graceful degradation.** Source retrieval, individual models in the pool, and
   the entire search backend can each fail without taking the report down.
   Source collection, in particular, is architecturally incapable of blocking

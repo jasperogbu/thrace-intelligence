@@ -60,11 +60,11 @@ optional background source collection.
    ┌────────────▼─────────────┐   ┌─────────────▼──────────────┐
    │  VENTURE INTELLIGENCE    │   │  COMPANY X-RAY             │
    │  9 fixed sections        │   │  8 fixed sections          │
-   │  ≤1300 output tokens     │   │  ≤1000 output tokens       │
+   │  ≤2900 output tokens     │   │  ≤1400 output tokens       │
    └──────────────────────────┘   └────────────────────────────┘
    ┌──────────────────────────┐
    │  DISCOVERY               │   4 opportunity cards, framed as
-   │  ≤900 output tokens      │   hypotheses worth validating
+   │  ≤1250 output tokens     │   hypotheses worth validating
    └──────────────────────────┘
                 │
    ┌────────────▼───────────────────────────────────────────────┐
@@ -125,10 +125,31 @@ any incentive for the model to produce one.
 #### 3.4.3 Output ceilings
 
 Generation time scales with output length, so each feature has a hard token
-ceiling: 1300 for Venture Intelligence, 1000 for Company X-Ray, 900 for
-Discovery, 500 for report Q&A. Dense markdown tokenises at roughly 4–6
-characters per token on the model in use, so the venture ceiling corresponds to
-roughly a 5.8k-character report.
+ceiling: 2900 for Venture Intelligence, 1400 for Company X-Ray, 1250 for
+Discovery, 700 for report Q&A.
+
+These are ceilings rather than targets, and the distinction is the whole
+point. The model's own judgement decides how long an answer should be; the
+ceiling only has to be high enough to let it finish. With the ceiling lifted
+until nothing was cut off, the natural output measured 6,300–9,200 characters
+for a venture report, 4,200 for an X-ray and 3,550 for a discovery scan —
+roughly 1,600–2,300, 1,050 and 890 tokens. Dense markdown tokenises at
+roughly 4–6 characters per token on the model in use, so each ceiling is set
+about a third above what that feature actually writes.
+
+A ceiling below the natural length does not produce a shorter report. It
+produces a report with the end removed: a venture report capped at 1,300
+tokens stopped mid-clause inside Key Metrics, on "Rider Utilization Rate
+(the number of completed paid deliveries per", immediately above the Sources
+block, which made the truncation look deliberate. This was the single largest
+quality defect found in testing.
+
+Because a report cut at any length can end on a line that resembles a
+deliberate short fragment, truncation is detected two ways: the tail must end
+on sentence punctuation or genuine markdown structure, and each feature
+supplies the shortest plausible finished length for itself, so a report that
+stopped after a couple of hundred characters is caught even when its last
+line reads like a label.
 
 The ceilings are tuned to **complete** rather than to truncate. A report cut
 off mid-sentence reads as a broken product rather than a concise one. A
@@ -188,7 +209,39 @@ receives a boost when the query names its country. A query of *"fintech in
 Lagos"* therefore leads with the Central Bank of Nigeria and the securities
 regulator, while *"agriculture marketplace for farmers"* leads with the FAO.
 
-#### 3.5.3 Non-blocking by construction
+#### 3.5.3 Links are verified, and labelled for reading
+
+A search provider returns whatever its index holds, including slugs that no
+longer resolve: a live report cited `gocaby.com/services/last-mile`, which
+returns 404. A dead link inside a Sources block contradicts the only promise
+that block makes, so every candidate from tier 1 is checked before it is cited.
+The checks run in parallel on the collector's background thread, bounded per
+request, so they cost the reader nothing.
+
+The distinction that matters is between *gone* and *unconfirmed*. Only 404 and
+410 are treated as gone and dropped. A 403, a TLS failure or a timeout means
+the check could not confirm the link, not that the page is missing, so those
+are kept — dropping them would discard real pages on a flaky network, and
+Facebook in particular answers 400 to every automated request. Unconfirmed
+links are cited last, behind everything confirmed, because a page that was
+actually loaded is strictly better evidence than one that was never reached.
+Tier 2 then fills any gap, so the three-link floor holds regardless.
+
+Labels are derived from the URL rather than trusted from the search result,
+which frequently has no title. The site name is the reliable part, so the path
+is used only where it actually describes the page: navigation words
+(*services*, *blog*, *reel*, *in*, *wiki*) and opaque identifiers — page ids,
+hashes and social handles — are discarded. A report that cited
+`facebook — 61557964839510` and `instagram — p` now cites `Facebook` and
+`Instagram`; where a path is genuinely descriptive it is kept and tidied, so
+`giglogistics.com/last-mile/` reads as `Giglogistics — Last Mile`.
+
+For the same reason, a social-media post is ranked below a company's own page
+or an institutional report. Social links stay eligible, because a page is
+sometimes the only record of a fact, but they are cited last: they are
+engagement surfaces, not authorities.
+
+#### 3.5.4 Non-blocking by construction
 
 The collector runs on a background thread started **before** generation begins,
 so by the time the model finishes, retrieval is usually already complete. A

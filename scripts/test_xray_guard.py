@@ -16,6 +16,7 @@ Exits non-zero if any check fails.
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 
@@ -192,7 +193,12 @@ check("Q&A prompt forbids starting a new analysis", "do not" in captured.get("pr
 # The curated fallback is what ships while the search provider has no credits,
 # so it is the path most likely to regress silently.
 real_live_search = intelligence._live_search
+real_http_status = intelligence._http_status
 intelligence._live_search = lambda query, limit: []  # simulate no search backend
+# Cited links are now verified before use. Stub the probe so these checks stay
+# offline and deterministic, and so a fixture URL is not judged by whether it
+# happens to exist today.
+intelligence._http_status = lambda url, timeout: 200
 
 bad_cases = []
 SOURCE_QUERIES = (
@@ -296,6 +302,81 @@ check(
 )
 intelligence._live_search = real_live_search
 
+# A Sources block that reads "facebook — 61557964839510" and "instagram — p"
+# is the shape a real report shipped: the label was the host plus whatever came
+# next in the path, which is site navigation far more often than it is a title.
+_label_cases = [
+    # Opaque ids and handles leave nothing behind, so the site name stands.
+    ("https://www.instagram.com/reel/DSCIZ2LjWY4/?hl=en", "Instagram"),
+    ("https://www.facebook.com/Justbezilogistics01/", "Facebook"),
+    # Navigation words ("in", "wiki") are dropped; a descriptive one is kept.
+    ("https://www.linkedin.com/in/max-ng-1b1a4b58", "Linkedin — Max"),
+    ("https://en.wikipedia.org/wiki/Last-mile_delivery", "Wikipedia — Last Mile Delivery"),
+    # Multi-label and unknown suffixes must not leak into the name.
+    ("https://www.cbn.gov.ng/", "Cbn"),
+    ("https://giglogistics.com/last-mile/", "Giglogistics — Last Mile"),
+    ("https://gocaby.com/services/last-mile", "Gocaby — Last Mile"),
+]
+check(
+    "a source label never leaks an id, handle, query string or domain suffix",
+    not [
+        u for u, _ in _label_cases
+        if re.search(r"\d{2,}|\?|\.(com|ng|org|co\.uk)\b", intelligence._label_from(u))
+    ],
+    f"offenders={[(u, intelligence._label_from(u)) for u, _ in _label_cases]}",
+)
+check(
+    "navigation words are dropped and a descriptive path is kept",
+    all(
+        intelligence._label_from(u) == want for u, want in _label_cases
+    ),
+    f"got={[(u, intelligence._label_from(u)) for u, _ in _label_cases]}",
+)
+check(
+    "a label is derived for anything at all, and never raises",
+    all(
+        isinstance(intelligence._label_from(candidate), str)
+        for candidate in ("", "   ", "http://", "https://x", "not a url", None)
+    ),
+)
+
+# A dead link in a Sources block contradicts the only promise that block
+# makes, and a search provider does return slugs that 404.
+_probe_statuses = {
+    "https://alive.example/page": 200,
+    "https://blocked.example/page": 403,
+    "https://gone.example/page": 404,
+    "https://removed.example/page": 410,
+    "https://unreachable.example/page": None,
+    "https://social.example/handle": 200,
+}
+intelligence._http_status = lambda url, timeout: _probe_statuses.get(url)
+_verified = intelligence._verified(
+    [{"label": "x", "url": u} for u in _probe_statuses], timeout=1
+)
+_verified_urls = [s["url"] for s in _verified]
+check(
+    "a link the server reports as gone is dropped, not cited",
+    "https://gone.example/page" not in _verified_urls
+    and "https://removed.example/page" not in _verified_urls,
+    f"cited={_verified_urls}",
+)
+check(
+    "a link that merely refuses an automated request is kept",
+    "https://blocked.example/page" in _verified_urls,
+    "403 is a refusal, not an absence",
+)
+check(
+    "an unreachable link is kept, because absence is unproven",
+    "https://unreachable.example/page" in _verified_urls,
+)
+check(
+    "a social post is cited after a page that was actually confirmed",
+    _verified_urls.index("https://social.example/handle") > 1,
+    f"order={_verified_urls}",
+)
+intelligence._http_status = real_http_status
+
 check(
     "a local query is led by a local regulator",
     intelligence._official_fallback("fintech in Lagos")[0]["url"].endswith("cbn.gov.ng"),
@@ -337,10 +418,26 @@ check(
 )
 
 # --- 8. reports are capped and prompts demand brevity ----------------------
+# The ceiling has to clear what the model actually writes and still sit far
+# below the old pipeline's 14.2k-character output. Measured natural lengths
+# with the cap lifted: venture ~2,150 tokens, x-ray ~900, discovery ~890. The
+# venture ceiling was 1,300, which is *under* the natural length — which does
+# not make reports concise, it amputates the last third of them, ending on
+# "Rider Utilization Rate (the number of completed paid deliveries per".
+# So the bound is: above the measured need, well below an essay.
 check(
-    "the venture ceiling is far below the old 14.2k-character output",
-    agents._max_tokens("venture") <= 1400,
+    "the venture ceiling clears the measured natural length but stays an order "
+    "of magnitude below the old 14.2k output",
+    2150 < agents._max_tokens("venture") < 3550,
     f"venture={agents._max_tokens('venture')}",
+)
+check(
+    "every ceiling clears the length its own feature actually writes",
+    all(
+        agents._max_tokens(kind) > agents._MIN_REPORT_CHARS[kind] / 3
+        for kind in ("venture", "xray", "discover")
+    ),
+    f"caps={ {k: agents._max_tokens(k) for k in ('venture', 'xray', 'discover')} }",
 )
 check(
     "the x-ray ceiling is tighter still",
@@ -415,6 +512,29 @@ check(
     "truncation is detected on prose but not on markdown structure",
     not wrong,
     f"mismatches={wrong}",
+)
+
+# The detector has no opinion about length unless the caller — which knows how
+# long its own feature should write — supplies a floor. A stub too short to be
+# any real report ends on lines that pass as deliberate fragments, so the floor
+# is the only thing that catches it.
+_STUB = (
+    "# Executive Summary\n* **Verdict:** **PURSUE**\n"
+    "* **High-Yield Niche:** Abuja's decentralized geography and high"
+)
+check(
+    "a 200-character stub is caught by the caller's floor",
+    intelligence.looks_truncated(_STUB, min_chars=agents._MIN_REPORT_CHARS["venture"]),
+    f"len={len(_STUB)} floor={agents._MIN_REPORT_CHARS['venture']}",
+)
+check(
+    "the floor does not fire without one, so short answers are unaffected",
+    not intelligence.looks_truncated("Risk: regulatory change. Mitigate by phasing."),
+)
+check(
+    "a floor below the stub leaves it to the tail heuristic",
+    not intelligence.looks_truncated(_STUB, min_chars=100),
+    "the stub's last line reads as a short label",
 )
 
 # --- 9. discovery stays on the knowledge path ------------------------------
